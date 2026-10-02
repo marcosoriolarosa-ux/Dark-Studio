@@ -1,0 +1,12 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart>=0.0.7
+pydantic==2.7.4
+httpx==0.27.0
+faster-whisper>=1.1.0
+python-dotenv>=1.0.1
+
+# Test suite. pytest.ini sets asyncio_mode = auto, which needs pytest-asyncio,
+# so a fresh install cannot run the tests without these two.
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
