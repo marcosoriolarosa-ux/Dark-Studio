@@ -383,7 +383,7 @@ def stage_project_assets(
             suffix = asset_path.suffix.lower()
             if suffix not in IMAGE_EXTENSIONS and suffix not in VIDEO_EXTENSIONS:
                 continue
-            if suffix in IMAGE_EXTENSIONS and looks_padded(asset_path):
+            if suffix in IMAGE_EXTENSIONS and _is_padded(asset_path):
                 rejected.append({
                     "scene": idx,
                     "rejected_url": candidate,
@@ -410,6 +410,24 @@ def stage_project_assets(
             audio_ref = None
 
     return media_refs, audio_ref, rejected
+
+
+def _is_padded(asset_path: Path) -> bool:
+    """Best-effort version of :func:`looks_padded` that cannot kill a render.
+
+    The padding probe shells out to ffprobe/ffmpeg, which the install docs list
+    as an *optional* dependency: "sem ffmpeg, ``looks_padded`` devolve sempre
+    False". A missing binary made the raw call raise ``FileNotFoundError`` out
+    of ``stage_project_assets``, and because staging happens before the render
+    try-block in :func:`render_video_hyperframes`, that took the whole request
+    down instead of merely skipping the quality check. The probe is advisory:
+    when it cannot run, the asset is kept, which is the same outcome as a clean
+    image and never the "broken frame" the check exists to prevent.
+    """
+    try:
+        return bool(looks_padded(asset_path))
+    except (OSError, ValueError, SubprocessError):
+        return False
 
 
 def _scene_times(scene: Dict[str, Any], idx: int) -> tuple[float, float]:
@@ -784,6 +802,26 @@ def _ducked_mix_filter(params: Dict[str, Any], duration: float) -> str:
     return graph
 
 
+def _flat_mix_filter(params: Dict[str, Any], duration: float) -> str:
+    """Two-input graph with no ducking: voice and bed summed at their own levels.
+
+    The voice is NOT split here. Nothing keys off it when ``duck_voice`` is off,
+    and a second ``asplit`` output left unconsumed makes ffmpeg abort with
+    "Filter asplit has an unconnected output" (a fatal error, since every
+    labelled filter output must be consumed by another filter or by ``-map``).
+    That failure was silent end to end: the non-zero exit fell into the
+    mixer's error path, which returned the original video and reported the bed
+    as "ffmpeg indisponivel ou mixagem falhou".
+    """
+    ceiling = 10 ** (float(params["voice_target_db"]) / 20.0)
+    return (
+        f"[0:a]anull[voice];"
+        f"[1:a]{_music_chain(params, duration)}[bed];"
+        f"[voice][bed]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];"
+        f"[mixed]alimiter=limit={ceiling:.4f}[out]"
+    )
+
+
 def _music_only_filter(params: Dict[str, Any], duration: float) -> str:
     """Graph for a video with no audio track: the music becomes the audio."""
     ceiling = 10 ** (float(params["voice_target_db"]) / 20.0)
@@ -839,11 +877,10 @@ def mix_audio_track(
     if has_audio is not False:
         # Also the fallback for an unprobeable file: tried first, retried without
         # audio below, so a missing stream costs one extra call at worst.
-        graph = _ducked_mix_filter(params, duration) if params["duck_voice"] else (
-            "[0:a]asplit=2[voice][key];"
-            f"[1:a]{_music_chain(params, duration)}[bed];"
-            f"[voice][bed]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];"
-            f"[mixed]alimiter=limit={10 ** (float(params['voice_target_db']) / 20.0):.4f}[out]"
+        graph = (
+            _ducked_mix_filter(params, duration)
+            if params["duck_voice"]
+            else _flat_mix_filter(params, duration)
         )
         plans.append([
             "ffmpeg", "-v", "error", "-y",

@@ -884,7 +884,9 @@ class TestMixAudioTrack:
         )
         assert result == output
         assert output.exists() and output.stat().st_size > 0
-        ffmpeg_calls = [call for call in calls if call[0][0] == "ffmpeg"]
+        # calls holds one argv list per invocation, so call[0] IS the
+        # program name; call[0][0] would be only its first character.
+        ffmpeg_calls = [call for call in calls if call[0] == "ffmpeg"]
         assert ffmpeg_calls, "the mix must actually shell out to ffmpeg"
         command = ffmpeg_calls[0]
         assert "-filter_complex" in command
@@ -905,13 +907,52 @@ class TestMixAudioTrack:
         )
         result = mix_audio_track(video, track, output, total_duration=8.0)
         assert result == output
-        command = [call for call in calls if call[0][0] == "ffmpeg"][0]
+        command = [call for call in calls if call[0] == "ffmpeg"][0]
         assert "-filter_complex" not in command
-        assert command[command.index("-map") + 1] == "1:a:0"
+        # The video comes from input 0 and the music from input 1, so the
+        # SECOND -map (not the first) is the stream that becomes the
+        # audio: index() alone would land on the video map.
+        maps = [command[i + 1] for i, arg in enumerate(command) if arg == "-map"]
+        assert maps == ["0:v:0", "1:a:0"], (
+            "a silent video keeps input 0's video and takes the bed from input 1"
+        )
 
     def test_without_a_music_track_the_original_is_returned(self, tmp_path):
         video, track = self._files(tmp_path)
         assert mix_audio_track(video, None, tmp_path / "out.mp4") == video
+
+    def test_no_ducking_still_consumes_every_filter_label(self, monkeypatch, tmp_path):
+        """A duck_voice=False mix must not leave a filter output dangling.
+
+        ffmpeg treats any labelled filter output that no other filter and no
+        -map consumes as fatal ("Filter asplit has an unconnected output"), and
+        that abort used to hide behind the mixer's catch-all: the render still
+        succeeded, just silently without the bed.
+        """
+        video, track = self._files(tmp_path)
+        output = tmp_path / "mixed.mp4"
+        calls = []
+        monkeypatch.setattr(render_engine_module(), "subprocess", _fake_ffmpeg(calls))
+        result = mix_audio_track(
+            video, track, output, duck_voice=False, total_duration=8.0
+        )
+        assert result == output
+        command = [call for call in calls if call[0] == "ffmpeg"][0]
+        graph = command[command.index("-filter_complex") + 1]
+        assert "sidechaincompress" not in graph, "ducking is off for this call"
+        declared, consumed = _graph_labels(graph)
+        # A graph output may be claimed by -map rather than by a later filter.
+        mapped = [
+            arg[1:-1] for arg in command
+            if arg.startswith("[") and arg.endswith("]") and arg[1].isalpha()
+        ]
+        assert declared[-1] == "out", "the graph's final output is [out]"
+        assert "out" in mapped, "and -map carries it into the file"
+        # Every labelled output has to be picked up by a later filter or by
+        # -map; ffmpeg exits non-zero on the leftovers rather than ignoring them.
+        assert sorted(consumed + mapped) == sorted(declared), (
+            "ffmpeg aborts on a filter output nothing consumes"
+        )
 
     def test_a_zero_volume_is_a_no_op(self, monkeypatch, tmp_path):
         video, track = self._files(tmp_path)
@@ -960,6 +1001,24 @@ def _fake_ffmpeg(calls, audio_streams=("audio",)):
             return FakeCompleted("")
 
     return Fake
+
+
+def _graph_labels(graph):
+    """Split a filter_complex graph into its declared and consumed labels.
+
+    A stream selector ("[0:a]") is not a label; only named pads count.
+    """
+    declared, consumed = [], []
+    for chain in graph.split(";"):
+        chain = chain.strip()
+        if not chain:
+            continue
+        match = re.search(r'\[([A-Za-z_][A-Za-z0-9_]*)\]$', chain)
+        head = chain[: chain.rindex('[')] if match else chain
+        consumed.extend(re.findall(r'\[([A-Za-z_][A-Za-z0-9_]*)\]', head))
+        if match:
+            declared.append(match.group(1))
+    return declared, consumed
 
 
 class TestRenderPayloadCarriesTheNewKeys:
