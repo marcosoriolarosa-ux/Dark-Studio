@@ -585,3 +585,459 @@ class TestSrtRoundTrip:
         from backend.services.pipeline import UPLOAD_DIR
 
         assert parse_srt_to_segments(UPLOAD_DIR / "definitely_absent.srt") == []
+
+# --------------------------------------------------------------------------
+# Wave 1: user-configurable subtitle styling, theme presets and background
+# music. The schema modules (style.py, music.py) own validation; these tests
+# cover the renderer's side of the contract: that the style actually reaches the
+# CSS, that the preset never mutates the caller's storyboard, and that the music
+# stage can fail without ever losing a render.
+# --------------------------------------------------------------------------
+
+import asyncio  # noqa: E402  (kept next to the tests that use it)
+import subprocess  # noqa: E402
+
+from backend.services.style import SubtitleStyle, get_preset, preset_names  # noqa: E402
+from backend.services.render_engine import (  # noqa: E402
+    apply_preset_to_storyboard,
+    build_subtitle_css,
+    mix_audio_track,
+    render_video_hyperframes,
+)
+
+# Values a settings form must never be able to smuggle past the CSS block.
+HOSTILE_STYLE = {
+    "font_family": "Inter; }body{display:none",
+    "primary_color": "red; }body{display:none",
+    "stroke_color": "#fff",
+    "background_color": "url(https://evil.test/x.svg)",
+}
+
+
+def _storyboard(rows=None):
+    """Two plain scenes with no background of their own.
+
+    ``build_storyboard_from_segments`` paints every scene its own background and
+    picks a caption style per scene, which would mask the preset palette and the
+    configured mode. These scenes say nothing, so the preset and the style are
+    the only things that can decide.
+    """
+    scenes = [
+        {"index": 1, "start": 0.0, "end": 4.0, "duration": 4.0, "caption": "primeira"},
+        {"index": 2, "start": 4.0, "end": 8.0, "duration": 4.0, "caption": "segunda"},
+    ]
+    for scene, (start, end, text) in zip(scenes, rows or []):
+        scene.update({"start": start, "end": end, "duration": end - start, "caption": text})
+    return scenes
+
+
+def _karaoke_storyboard():
+    storyboard = _storyboard()
+    storyboard[0]["words"] = [
+        {"word": "primeira", "start": 0.2, "end": 0.9},
+        {"word": "palavra", "start": 0.9, "end": 1.6},
+        {"word": "final", "start": 1.6, "end": 2.4},
+    ]
+    storyboard[0]["caption_style"] = "karaoke"
+    return storyboard
+
+
+def _css_block(html):
+    return html.split("<style>", 1)[1].split("</style>", 1)[0]
+
+
+class TestSubtitleStyleReachesTheCss:
+    def test_font_size_colour_and_stroke_appear_in_the_generated_css(self):
+        style = {
+            "font_size": 96,
+            "primary_color": "#22D3EE",
+            "stroke_color": "#0E7490",
+            "stroke_width": 7,
+            "font_family": "Montserrat",
+        }
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0, subtitle_style=style
+        )
+        css = _css_block(html)
+        assert "font-size: 96px" in css
+        assert "color: #22D3EE" in css
+        assert "-webkit-text-stroke: 7px #0E7490" in css
+        assert "font-family: Montserrat" in css
+
+    def test_out_of_range_numbers_are_clamped_not_trusted(self):
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0,
+            subtitle_style={"font_size": 9999, "stroke_width": -5},
+        )
+        css = _css_block(html)
+        assert "font-size: 160px" in css, "font size must clamp to FONT_SIZE_MAX"
+        assert "-webkit-text-stroke: 0px #000000" in css, "stroke clamps to 0, never negative"
+
+    def test_a_hijacked_style_cannot_escape_the_css_block(self):
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0, subtitle_style=HOSTILE_STYLE
+        )
+        css = _css_block(html)
+        assert "display:none" not in css
+        assert "url(" not in css
+        assert "javascript:" not in css
+        # The bad values fell back to their defaults rather than being emitted.
+        assert "font-family: Inter" in css
+        assert "color: #FFFFFF" in css
+        # Braces stay balanced: the injected "}" cannot close the rule early.
+        assert css.count("{") == css.count("}")
+        assert css.count("{") >= 2
+
+    def test_position_moves_the_container_alignment(self):
+        top = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0,
+            subtitle_style={"position": "top"},
+        )
+        bottom = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0,
+            subtitle_style={"position": "bottom"},
+        )
+        assert "align-items: flex-start" in _css_block(top)
+        assert "align-items: flex-end" in _css_block(bottom)
+        assert "align-items: flex-start" not in _css_block(bottom)
+
+    def test_the_styled_block_outranks_the_hardcoded_variants(self):
+        """The hook variant is two classes deep, so a bare rule would lose."""
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0,
+            subtitle_style={"mode": "hook", "font_size": 120},
+        )
+        styled = build_subtitle_css(SubtitleStyle.from_dict({"mode": "hook", "font_size": 120}))
+        assert ".caption.hook .caption-text" in styled, (
+            "the styled rule must match the variant rule's specificity"
+        )
+        assert html.index(styled) > html.index(".caption.hook .caption-text"), (
+            "the styled block must come after the static variants to win"
+        )
+
+    def test_build_subtitle_css_uses_the_style_and_the_position_table(self):
+        css = build_subtitle_css(
+            SubtitleStyle.from_dict({"position": "center", "font_size": 40})
+        )
+        assert css.count("{") == css.count("}") == 2
+        assert "align-items: center" in css
+        assert "font-size: 40px" in css
+
+
+class TestPresetApplication:
+    def test_a_preset_paints_palette_transition_and_effect(self):
+        storyboard = _storyboard()
+        preset = get_preset("neon")
+        styled = apply_preset_to_storyboard(storyboard, "neon")
+
+        backgrounds = [scene.get("background") for scene in styled]
+        assert backgrounds == [preset.palette[0], preset.palette[1]]
+        assert all(scene["transition"] == preset.transition for scene in styled)
+        assert all(scene["effect"] == preset.effect for scene in styled)
+
+    def test_an_explicit_background_is_never_overwritten(self):
+        storyboard = _storyboard()
+        storyboard[0]["background"] = "#123456"
+        styled = apply_preset_to_storyboard(storyboard, "neon")
+        assert styled[0]["background"] == "#123456"
+
+    def test_the_input_storyboard_is_never_mutated(self):
+        storyboard = _storyboard()
+        snapshot = [dict(scene) for scene in storyboard]
+        styled = apply_preset_to_storyboard(storyboard, "bold")
+        assert storyboard == snapshot
+        assert styled is not storyboard
+        assert all(copy is not scene for copy, scene in zip(styled, storyboard))
+
+    def test_no_preset_returns_equal_copies(self):
+        storyboard = _storyboard()
+        snapshot = [dict(scene) for scene in storyboard]
+        styled = apply_preset_to_storyboard(storyboard, None)
+        assert styled == snapshot
+        assert styled[0] is not storyboard[0]
+
+    def test_an_unknown_preset_name_falls_back_without_raising(self):
+        styled = apply_preset_to_storyboard(_storyboard(), "no-such-preset")
+        assert len(styled) == 2
+
+    def test_every_catalogue_preset_renders(self):
+        for name in preset_names():
+            html = generate_composition_html(
+                "p", _storyboard(), {}, None, "vertical", 8.0, preset=name
+            )
+            assert "caption-text" in html
+            assert html.count("{") == html.count("}")
+
+    def test_preset_reaches_the_scene_backgrounds_in_the_html(self):
+        palette = get_preset("podcast").palette
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0, preset="podcast"
+        )
+        assert f'background:{palette[0]};' in html
+        assert f'background:{palette[1]};' in html
+
+
+class TestStyledComposition:
+    def test_default_render_carries_no_styled_block_and_keeps_the_hook(self):
+        storyboard = _storyboard()
+        for scene in storyboard:
+            scene["caption_style"] = "bottom"
+        html = generate_composition_html(
+            "p", storyboard, {}, None, "vertical", 8.0
+        )
+        assert "Configurable caption styling" not in html
+        assert 'class="clip caption hook"' in html, (
+            "unconfigured renders keep the legacy hook opening frame"
+        )
+        assert 'class="clip caption bottom"' in html
+
+    def test_karaoke_mode_with_a_style_still_emits_word_spans_and_tweens(self):
+        storyboard = _karaoke_storyboard()
+        words = storyboard[0]["words"]
+        html = generate_composition_html(
+            "p", storyboard, {}, None, "vertical", 8.0,
+            subtitle_style={"mode": "karaoke", "font_size": 64, "position": "center"},
+        )
+        assert html.count('class="karaoke-word"') == 3
+        assert '<span class="karaoke-word">primeira</span> <span class="karaoke-word">' in html, (
+            "inline-block words must stay separated by spaces"
+        )
+        for idx in range(1, len(words) + 1):
+            assert f"#caption-0 .karaoke-word:nth-of-type({idx})" in html
+        assert "align-items: center" in _css_block(html)
+        assert "font-size: 64px" in _css_block(html)
+
+    def test_a_scenes_own_caption_style_overrides_the_global_mode(self):
+        storyboard = _storyboard()
+        storyboard[0]["caption_style"] = "bottom"
+        storyboard[1]["caption_style"] = "center"
+        html = generate_composition_html(
+            "p", storyboard, {}, None, "vertical", 8.0,
+            subtitle_style={"mode": "hook", "font_size": 90},
+        )
+        # The global mode supplies the typography to both...
+        assert "font-size: 90px" in _css_block(html)
+        # ...but the per-scene override decides each caption's variant.
+        assert 'class="clip caption bottom"' in html
+        assert 'class="clip caption center"' in html
+        assert 'class="clip caption hook"' not in html, (
+            "a scene's explicit caption_style must beat the configured mode"
+        )
+
+    def test_the_configured_mode_applies_when_a_scene_says_nothing(self):
+        html = generate_composition_html(
+            "p", _storyboard(), {}, None, "vertical", 8.0,
+            subtitle_style={"mode": "center"},
+        )
+        assert 'class="clip caption center"' in html
+
+    def test_hidden_mode_still_suppresses_the_caption(self):
+        storyboard = _storyboard()
+        storyboard[0]["caption_style"] = "hidden"
+        html = generate_composition_html(
+            "p", storyboard, {}, None, "vertical", 8.0,
+            subtitle_style={"mode": "karaoke"},
+        )
+        assert "caption-0" not in html
+
+    def test_styling_does_not_break_the_renderer_contract(self):
+        html = generate_composition_html(
+            "p", _storyboard(), {0: "assets/a.png"}, None, "vertical", 8.0,
+            subtitle_style={"mode": "karaoke"},
+        )
+        assert 'data-composition-id="main"' in html
+        assert "gsap.timeline({ paused: true })" in html
+        assert 'window.__timelines["main"] = tl' in html
+        assert "repeat: -1" not in html
+        assert 'src="assets/a.png"' in html
+
+
+class TestMixAudioTrack:
+    def _files(self, tmp_path):
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 128)
+        track = tmp_path / "bed.wav"
+        track.write_bytes(b"RIFF" + b"0" * 128)
+        return video, track
+
+    def test_a_missing_ffmpeg_returns_the_original_and_never_raises(
+        self, monkeypatch, tmp_path
+    ):
+        video, track = self._files(tmp_path)
+        output = tmp_path / "mixed.mp4"
+        monkeypatch.setattr(
+            render_engine_module(), "subprocess",
+            _raise_missing_binary(),
+        )
+        result = mix_audio_track(video, track, output, total_duration=8.0)
+        assert result == video, "a failed mix must return the untouched original"
+        assert not output.exists(), "no partial file may be left at the output path"
+        assert video.exists()
+
+    def test_a_successful_mix_writes_to_the_output_path(self, monkeypatch, tmp_path):
+        video, track = self._files(tmp_path)
+        output = tmp_path / "mixed.mp4"
+        calls = []
+        monkeypatch.setattr(render_engine_module(), "subprocess", _fake_ffmpeg(calls))
+        result = mix_audio_track(
+            video, track, output, music_volume=0.25, total_duration=8.0
+        )
+        assert result == output
+        assert output.exists() and output.stat().st_size > 0
+        ffmpeg_calls = [call for call in calls if call[0][0] == "ffmpeg"]
+        assert ffmpeg_calls, "the mix must actually shell out to ffmpeg"
+        command = ffmpeg_calls[0]
+        assert "-filter_complex" in command
+        assert "sidechaincompress" in "".join(command), "ducking uses the voice as key"
+        assert "-c:v" in command and command[command.index("-c:v") + 1] == "copy", (
+            "video is stream-copied, never re-encoded"
+        )
+        graph = command[command.index("-filter_complex") + 1]
+        assert "volume=0.2500" in graph, "the requested music volume must reach ffmpeg"
+
+    def test_a_silent_video_gets_the_music_as_its_only_audio(self, monkeypatch, tmp_path):
+        video, track = self._files(tmp_path)
+        output = tmp_path / "mixed.mp4"
+        calls = []
+        monkeypatch.setattr(
+            render_engine_module(), "subprocess",
+            _fake_ffmpeg(calls, audio_streams=()),
+        )
+        result = mix_audio_track(video, track, output, total_duration=8.0)
+        assert result == output
+        command = [call for call in calls if call[0][0] == "ffmpeg"][0]
+        assert "-filter_complex" not in command
+        assert command[command.index("-map") + 1] == "1:a:0"
+
+    def test_without_a_music_track_the_original_is_returned(self, tmp_path):
+        video, track = self._files(tmp_path)
+        assert mix_audio_track(video, None, tmp_path / "out.mp4") == video
+
+    def test_a_zero_volume_is_a_no_op(self, monkeypatch, tmp_path):
+        video, track = self._files(tmp_path)
+        monkeypatch.setattr(
+            render_engine_module(), "subprocess",
+            _raise_missing_binary(),
+        )
+        result = mix_audio_track(
+            video, track, tmp_path / "out.mp4", music_volume=0.0, total_duration=8.0
+        )
+        assert result == video
+
+
+def render_engine_module():
+    import backend.services.render_engine as engine
+
+    return engine
+
+
+def _raise_missing_binary():
+    class Missing:
+        @staticmethod
+        def run(*args, **kwargs):
+            raise FileNotFoundError("ffmpeg")
+
+    return Missing
+
+
+def _fake_ffmpeg(calls, audio_streams=("audio",)):
+    class FakeCompleted:
+        def __init__(self, stdout):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    class Fake:
+        @staticmethod
+        def run(command, **kwargs):
+            calls.append(list(command))
+            if command[0] == "ffprobe":
+                return FakeCompleted("\n".join(audio_streams))
+            # ffmpeg was asked to write its last argument: create it, so the
+            # mixer sees the staged file and moves it into place.
+            Path = __import__("pathlib").Path
+            Path(command[-1]).write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 256)
+            return FakeCompleted("")
+
+    return Fake
+
+
+class TestRenderPayloadCarriesTheNewKeys:
+    def _patched(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(engine, "stage_project_assets", lambda *a, **k: ({}, None, []))
+        monkeypatch.setattr(engine, "get_media_duration", lambda _p: 5.0)
+        monkeypatch.setattr(engine, "cleanup_render_dirs", lambda keep=None: 0)
+
+        async def fake_render(project_name, composition_html, output_path, *args):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 128)
+            return {"status": "rendered", "output_path": str(output_path), "stdout": ""}
+
+        monkeypatch.setattr(engine, "render_with_hyperframes", fake_render)
+        return engine
+
+    def test_a_plain_render_reports_the_resolved_look_and_no_music(self, monkeypatch, tmp_path):
+        engine = self._patched(monkeypatch, tmp_path)
+        srt = tmp_path / "proj.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+        result = asyncio.run(engine.render_video_hyperframes("proj", srt))
+        assert result["status"] == "rendered"
+        assert result["preset"] == "cinematic"
+        assert result["subtitle_style"]["font_size"] == 52
+        assert result["music"] == {
+            "requested": None, "applied": False, "track_id": None,
+            "volume": 0.18, "duck_voice": True, "note": "",
+        }
+
+    def test_a_configured_style_and_preset_are_echoed_back(self, monkeypatch, tmp_path):
+        engine = self._patched(monkeypatch, tmp_path)
+        srt = tmp_path / "proj2.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+        result = asyncio.run(
+            engine.render_video_hyperframes(
+                "proj2", srt, preset="neon",
+                subtitle_style={"font_size": 33, "position": "top"},
+            )
+        )
+        assert result["preset"] == "neon"
+        assert result["subtitle_style"]["font_size"] == 33
+        assert result["subtitle_style"]["position"] == "top"
+        # The preset's own caption look survives an override on unrelated fields.
+        assert result["subtitle_style"]["font_family"] == "Bebas Neue"
+
+    def test_an_unknown_music_track_still_renders(self, monkeypatch, tmp_path):
+        engine = self._patched(monkeypatch, tmp_path)
+        srt = tmp_path / "proj3.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+        result = asyncio.run(
+            engine.render_video_hyperframes("proj3", srt, music_track="no-such-track")
+        )
+        assert result["status"] == "rendered", "an unknown track must not fail the render"
+        assert result["output_path"]
+        assert result["music"]["requested"] == "no-such-track"
+        assert result["music"]["applied"] is False
+        assert result["music"]["track_id"] is None
+        assert "no-such-track" in result["music"]["note"]
+
+    def test_the_error_path_still_carries_the_new_keys(self, monkeypatch, tmp_path):
+        engine = self._patched(monkeypatch, tmp_path)
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("npx exploded")
+
+        monkeypatch.setattr(engine, "render_with_hyperframes", boom)
+        srt = tmp_path / "proj4.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+        result = asyncio.run(
+            engine.render_video_hyperframes(
+                "proj4", srt, preset="bold", music_track="whatever", music_volume=0.3
+            )
+        )
+        assert result["status"] == "error"
+        assert result["preset"] == "bold"
+        assert isinstance(result["subtitle_style"], dict)
+        assert result["music"]["applied"] is False
+        assert result["music"]["volume"] == 0.3
+        assert result["music"]["note"]

@@ -1,0 +1,91 @@
+# =============================================================================
+#  Contexto de build do Dark Studio.
+#
+#  Regra desta lista: excluir o que e grande, secretado ou gerado. NUNCA excluir
+#  requirements.txt, backend/, frontend/ ou scripts/ - sao o que a imagem
+#  executa. Uma exclusao a mais aqui produz uma imagem que arranca e nao
+#  renderiza, ou nem arranca.
+# =============================================================================
+
+# --- Git e configuracao de agentes ---
+.git/
+.gitignore
+.github/
+.kilo/
+.agent-manager/
+
+# --- Ambientes Python locais ---
+# Nao vao para a imagem: o virtualenv e construido de requirements.txt dentro
+# do build. Copiar o .venv do host traria paths absolutos da maquina de origem
+# para um Python que nao existe na imagem.
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Junk de virtualenv do Windows que por vezes fica committed por engano.
+Scripts/
+Lib/
+Include/
+pyvenv.cfg
+
+# --- Node ---
+# O hyperframes e instalado em runtime via `npx --yes`, nao em build. Um
+# node_modules do host traria a resolucao de modulos da maquina de origem.
+node_modules/
+package-lock.json
+npm-debug.log*
+
+# --- Testes ---
+# O requirements.txt declara pytest/pytest-asyncio, por isso os pacotes estao na
+# imagem. O codigo dos testes, nao: nao e executado em runtime e mandar testes
+# para a imagem so aumenta a superficie de ataque.
+tests/
+pytest.ini
+
+# --- storage/ ---
+# Conteudo gerado pelo utilizador: videos, uploads, media, musicas. Nao pode
+# entrar na imagem (peso + dados do utilizador) - em runtime isto e um volume
+# nomeado, com storage/ a ser criada pela imagem com o owner certo.
+storage/*
+!storage/README.md
+
+# --- Segredos ---
+# As chaves chegam em runtime por `env_file` no docker-compose.yml ou por
+# `docker run -e`; nunca sao copiadas para dentro da imagem. O ficheiro e lido
+# pela app a partir de /app/.env, que nao existe na imagem - e por isso que o
+# preflight reporta o .env como ausente (AVISO, nao FALHA) e as chaves chegam do
+# ambiente.
+.env
+.env.*
+!.env.example
+
+# --- Ficheiros do sistema operativo / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.swp
+*~
+.idea/
+.vscode/
+*.bak
+*.tmp
+
+# --- Media e documentos ---
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.pdf
+*.mp4
+*.mp3
+*.wav

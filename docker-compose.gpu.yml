@@ -1,0 +1,83 @@
+# =============================================================================
+#  Dark Studio - override GPU. NAO E UM OVERRIDE COMPLETO; tem de ser usado
+#  sobre o docker-compose.yml:
+#
+#      docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+#
+# -----------------------------------------------------------------------------
+#  O QUE O GPU COMPRA AQUI - E SO ISTO
+# -----------------------------------------------------------------------------
+#  faster-whisper (transcricao de audio -> legendas automaticas) pode correr em
+#  CUDA. E o unico componente do Dark Studio que e GPU-friendly: e ctranslate2,
+#  uma biblioteca de inferencia que sabe usar a GPU.
+#
+#  O QUE O GPU NAO COMPRA - E O RENDER
+#  O HyperFrames renderiza com Chrome headless a compor frames de video. O
+#  Chrome neste contentor corre com --disable-gpu (ver o wrapper no Dockerfile):
+#  nao ha qualquer acceleratecao de video no caminho, e mesmo que houvesse, o
+#  encoder de saida e o ffmpeg, nao o Chrome. Um contentor com GPU NAO rende
+#  videos mais depressa. Se a espera por renders mais rapidos, a resposta e mais
+#  CPU e mais RAM, nao uma GPU.
+#
+#  Outro custo real da base CUDA: ocupa cerca de 6-8 GB de imagem em vez dos
+#  ~2 GB da base Python, porque traz o runtime CUDA e o cuDNN inteiro. So
+#  compensa se a transcricao com whisper for uso diario.
+# -----------------------------------------------------------------------------
+#  REQUISITOS (a verificar na sua maquina, nao assumidos aqui)
+#   1. Docker 19.03+ com o runtime NVIDIA instalado:
+#        nvidia-ctk runtime configure --runtime=docker
+#        systemctl restart docker
+#   2. Drivers NVIDIA 525+ e um container CUDA que arranca:
+#        docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
+#      Se este comando falhar, o problema e o runtime ou os drivers - nao este
+#      ficheiro.
+#   3. Memoria de video suficiente para o modelo do whisper. O modelo medio
+#      (small/medium) quer ~2-4 GB de VRAM.
+# -----------------------------------------------------------------------------
+
+services:
+  dark-studio:
+    build:
+      args:
+        # Base CUDA em vez de python:3.12-slim-bookworm. O Dockerfile e o
+        # mesmo: o estagio de build instala o python3 quando a base nao o tem,
+        # e o virtualenv e copiado entre estagios tal como no build normal.
+        # Tag com CUDA/cuDNN explicito, nunca `latest`.
+        BASE_IMAGE: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+      # Sem `timeout`: o Compose nao aceita esse campo em `build`, e um build
+      # demorado nao e o mesmo que uma imagem partida. O build da base CUDA
+      # demora tipicamente ~20 min numa maquina sem cache, por isso este
+      # override tem mais hypotheses de falhar por timeout do que o normal.
+
+    # `--gpus all` nao pode ser escrito num campo do YAML: e um parametro do
+    # `docker run`. O Compose aplica-o a partir do bloco seguinte, mas so em
+    # versoes que suportem `deploy.resources.reservations.devices`. Para
+    # garantir, o arranque mais explicito e:
+    #
+    #     docker compose -f docker-compose.yml -f docker-compose.gpu.yml \
+    #         run --gpus all -d --name dark-studio
+    #
+    # `count: all` abaixo e inerte - ignorado com um aviso - em versoes mais
+    # antigas do Compose.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    environment:
+      # faster-whisper escolhe o device por estas variaveis. Sem elas, o
+      # ctranslate2 fica no CPU mesmo dentro de um container com GPU - o
+      # contentor fica com a VRAM reservada e nao faz nada com ela, que e o modo
+      # mais comum de "instalei GPU e nao ficou mais rapido".
+      # Ver https://github.com/SYSTRAN/faster-whisper para o resto dos knobs.
+      WHISPER_DEVICE: "${WHISPER_DEVICE:-cuda}"
+      # Precisao da GPU. float16 e o normal; int8_float16 para VRAM pequena.
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE:-float16}"
+
+    # A base CUDA e muito maior e a imagem de video continua a nao usar GPU, por
+    # isso o limite de memoria sobe um pouco (a runtime CUDA aloca memoria de
+    # video no processo) mas nao precisa de muito mais. Ajuste ao hardware.
+    # mem_limit: 8g

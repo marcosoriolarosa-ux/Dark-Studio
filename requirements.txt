@@ -1,12 +1,56 @@
+# Dark Studio - dependencias Python.
+# Instalar SEMPRE dentro do ambiente virtual do projeto:
+#   Windows:  python -m venv .venv  &&  .venv\Scripts\python -m pip install -r requirements.txt
+#   Linux:    python3 -m venv .venv &&  .venv/bin/python -m pip install -r requirements.txt
+#
+# Nao editar este ficheiro para "dar jeito" a uma maquina: `python scripts/check_env.py`
+# valida exactamente a lista que esta aqui.
+
+# --- Core web (fixado: instalacoes reprodutiveis) ---
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-multipart>=0.0.7
 pydantic==2.7.4
 httpx==0.27.0
-faster-whisper>=1.1.0
 python-dotenv>=1.0.1
 
-# Test suite. pytest.ini sets asyncio_mode = auto, which needs pytest-asyncio,
-# so a fresh install cannot run the tests without these two.
+# --- Analise de audio / video ---
+# numpy e librosa sao OBRIGATORIOS, apesar de serem pesados: backend/services/
+# viral_pipeline.py faz `import librosa` / `import numpy` ao topo do modulo e
+# backend/app.py importa esse modulo, logo sem estes pacotes o servidor NAO
+# arranca de todo. Nao os tornar opcionais.
+# Nota: `import librosa` demora varios segundos no primeiro arranque (numba).
+numpy>=1.24.0
+librosa>=0.10.1
+
+# --- Transcricao de audio (opcional em tempo de arranque) ---
+# faster-whisper arrasta ctranslate2 + onnxruntime: download grande. O servidor
+# arranca sem ele; apenas a transcricao de audios carregados falha, com erro
+# explicito. Instale se for usar legendas automaticas.
+faster-whisper>=1.1.0
+
+# --- Sintese de voz ---
+# edge-tts usa o endpoint gratuito do Microsoft Edge e e a voz de narracao por
+# omissao. Trate-o como obrigatorio; se definir AZURE_SPEECH_KEY +
+# AZURE_SPEECH_REGION em .env, o servico Azure passa a ser usado em alternativa.
+edge-tts>=6.1.9
+
+# --- Binarios externos (NAO sao instalados pelo pip) ---
+# ffmpeg + ffprobe : backend/services/asset_quality.py e backend/services/pipeline.py
+#                    executam-nos em subprocess para medir duracao/qualidade.
+# node + npx       : backend/services/render_engine.py corre
+#                    `npx --yes hyperframes@<versao> render`.
+# Sem ffmpeg o servidor arranca, mas a geracao de video falha a meio.
+# Sem node/npx o servidor arranca, mas o render HyperFrames falha a meio.
+# Windows:  winget install --id Gyan.FFmpeg -e      (ou choco install ffmpeg)
+#           Node.js LTS: https://nodejs.org/en/download
+# Linux:    sudo apt install ffmpeg ; instale o Node LTS pelo gerenciador de pacotes
+# Verificacao: python scripts/check_env.py
+
+# --- Testes (nao e preciso para correr a aplicacao) ---
+# pytest.ini define asyncio_mode = auto, o que exige pytest-asyncio, por isso um
+# install novo nao consegue correr a suite sem estes tres.
+# tests/test_e2e.py e tests/test_live_providers.py tambem importam requests.
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+requests>=2.31.0

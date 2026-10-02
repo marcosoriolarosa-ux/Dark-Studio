@@ -1,0 +1,133 @@
+# =============================================================================
+#  Dark Studio - compose de producao.
+#
+#      cp .env.example .env      # e preencher pelo menos OPENROUTER_API_KEY
+#      docker compose up -d --build
+#      http://localhost:8013/app/
+#
+#  Para GPU (faster-whisper so; o render NAO usa GPU):
+#      docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+# =============================================================================
+
+services:
+  dark-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Mesmos pins que os ARG por omissao do Dockerfile, explicitos aqui para
+      # que uma mudanca de pin seja visivel no compose.
+      args:
+        BASE_IMAGE: python:3.12-slim-bookworm
+        NODE_VERSION: "22.14.0"
+        PUPPETEER_CHROME_VERSION: stable
+    image: dark-studio:local
+    container_name: dark-studio
+
+    ports:
+      # host:container. A porta do container tem de bater certo com
+      # DARK_STUDIO_PORT, porque o entrypoint usa essa variavel para ligar o
+      # uvicorn. As duas coisas tem de mudar em conjunto.
+      - "8013:8013"
+
+    environment:
+      # --- Porta e CORS -----------------------------------------------------
+      # DARK_STUDIO_ALLOWED_ORIGINS tem de corresponder EXACTAMENTE ao
+      # scheme://host:port que o browser usa para abrir a UI. Com
+      #   - "127.0.0.1:8013"  a UI e http://127.0.0.1:8013/app/
+      #   - "localhost:8013"  a UI e http://localhost:8013/app/
+      # sao origens DIFERENTES para o navegador, mesmo que apontem para a mesma
+      # maquina: a mismatch da um erro de CORS no fetch, nao no carregamento da
+      # pagina. O valor e sempre a origem completa, com esquema, nunca so
+      # host:port.
+      #
+      # Em acesso remoto a origem passa a ser a do cliente, por exemplo
+      # http://192.168.1.50:8013 - e o servidor tem de estar acessivel nesse
+      # endereco de rede. So e preciso mexer nesta variavel em acesso remoto; o
+      # backend/app.py ja aceita localhost e 127.0.0.1 por omissao.
+      DARK_STUDIO_PORT: "8013"
+      DARK_STUDIO_ALLOWED_ORIGINS: "${DARK_STUDIO_ALLOWED_ORIGINS:-http://localhost:8013,http://127.0.0.1:8013}"
+
+      # --- Chaves de API ----------------------------------------------------
+      # Todas com ${VAR:-}: o compose NAO falha quando a chave nao existe, passa
+      # a string vazia, e e a app que degrada com elegancia (ex.: sem
+      # PEXELS_API_KEY so usa material local). Um `environment: [PEXELS_API_KEY]`
+      # sem default faria o `docker compose up` abortar por causa de uma chave
+      # que a feature opcional nem usa.
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      OPENROUTER_MODEL: "${OPENROUTER_MODEL:-}"
+      PEXELS_API_KEY: "${PEXELS_API_KEY:-}"
+      PIXABAY_API_KEY: "${PIXABAY_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      YOUTUBE_API_KEY: "${YOUTUBE_API_KEY:-}"
+      AZURE_SPEECH_KEY: "${AZURE_SPEECH_KEY:-}"
+      AZURE_SPEECH_REGION: "${AZURE_SPEECH_REGION:-}"
+
+    env_file:
+      # O mesmo ficheiro .env que a app le em modo nativo. `required: false`
+      # (Compose >= 2.24) para `docker compose up` funcionar numa maquina limpa,
+      # onde as chaves ainda nao foram configuradas.
+      - path: .env
+        required: false
+
+    volumes:
+      # storage/ e o unico estado que o utilizador nao pode perder: uploads,
+      # media descarregado, musicas, thumbnails e os MP4 renderizados vivem
+      # aqui (ver STORAGE_DIR em backend/services/pipeline.py). Sem este volume,
+      # `docker compose down` apaga tudo o que foi gerado.
+      #
+      # A pasta storage/ e criada DENTRO da imagem com owner do utilizador
+      # darkstudio (uid 10001), e um volume nomeado vazio montado em
+      # /app/storage herda esse owner - por isso o container escreve sem root.
+      # Se um volume ja tiver sido criado por outra versao da imagem, com outro
+      # owner, o container aborta no arranque: `docker compose down -v` resolve.
+      - dark-studio-storage:/app/storage
+
+    # --- Sobrevivencia ------------------------------------------------------
+    # O container e reiniciado a nao ser que seja explicitamente parado: um
+    # reboot da maquina, um upgrade do Docker ou um qualquer evento nao
+    # relacionado nao devem deixar o servidor em baixo.
+    restart: unless-stopped
+
+    # PID 1 = tini. O render lanca Chrome, que por sua vez lanca varios
+    # subprocess (zygotes, renderers, audio); se ninguem os recolher, o container
+    # acumula processos zombie ate a tabela de processos do PID namespace
+    # encher. `init: true` e a forma suportada de resolver isto sem meter um
+    # supervisor dentro da imagem.
+    # Corresponde ao comentario no fim do Dockerfile: sem isto, corre com
+    # `docker run --init`.
+    init: true
+
+    # --- Recursos -----------------------------------------------------------
+    # O limite fica DESLIGADO de proposito. Headless Chrome a 1080x1920 mais o
+    # ffmpeg e o Python (numpy/librosa) somam facilmente 2-3 GB num unico render,
+    # e com dois renders concorrentes 5-6 GB nao e exagerado. Fixar um numero
+    # aqui sem conhecer o host e a forma rapida de um OOMKill no meio de uma
+    # geracao de video.
+    #
+    # RECOMENDACAO (descomente e ajuste ao seu hardware):
+    #   Maquina com 8 GB  ->  mem_limit: 6g
+    #   Maquina com 16 GB ->  mem_limit: 12g
+    # Sem limite, o contentor pode comer a RAM toda e o OOM killer do host escolhe
+    # outra vitima. O limite e superior ao de dois renders porque o /health e o
+    # servidor tem de continuar a responder durante um.
+    # mem_limit: 6g
+
+    # /dev/shm tem 64 MB por omissao no Docker. O Chrome escreve frames inteiros
+    # ai e rebenta com "session deleted because of page crash" num frame de
+    # 1080x1920. 2 GB e folgado para dois renders. (O Chrome tambem arranca com
+    # --disable-dev-shm-usage, definido no wrapper do Dockerfile, por isso isto
+    # e uma segunda camada de defesa e nao a unica.)
+    shm_size: "2gb"
+
+    # `docker compose logs -f dark-studio` mostra o preflight, o arranque do
+    # uvicorn e o codigo de saida no `docker stop`.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  dark-studio-storage:
+    name: dark-studio-storage

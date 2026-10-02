@@ -1,8 +1,12 @@
 
+import inspect
 import json
 import os
 import re
+import uuid
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +14,42 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+# Wave 1 services, imported as names rather than modules on purpose: backend.app is
+# the single seam the tests patch, so mock.patch.object(app_module, "generate_script")
+# is the only indirection between the API and the service layer.
+from backend.services.music import (
+    MOODS,
+    DEFAULT_MUSIC_VOLUME,
+    MUSIC_DIR,
+    AUDIO_SUFFIXES as MUSIC_AUDIO_SUFFIXES,
+    get_track,
+    list_tracks,
+    register_upload,
+    search_tracks,
+)
+from backend.services.script_gen import (
+    DEFAULT_LANGUAGE,
+    LANGUAGES,
+    MAX_DURATION,
+    MAX_SECTIONS,
+    MIN_DURATION,
+    SOURCE_FALLBACK,
+    generate_script,
+    get_languages,
+)
+from backend.services.style import (
+    VALID_CAPTION_MODES,
+    VALID_FONT_FAMILIES,
+    VALID_POSITIONS,
+    list_presets,
+)
+from backend.services.tts import (
+    DEFAULT_VOICE,
+    SUPPORTED_PROVIDERS,
+    get_tts_status,
+    list_voices,
+    synthesize_speech_long,
+)
 from backend.services.pipeline import (
     transcribe_audio_file,
     build_srt_from_segments,
@@ -30,7 +70,6 @@ from backend.services.pipeline import (
 )
 from backend.services.render_engine import render_video_hyperframes
 from backend.services.shorts_pipeline import generate_shorts, list_highlights
-from backend.services.viral_pipeline import render_viral_video
 from backend.services.auth_contract import AuthError, to_response
 
 app = FastAPI(title="Dark Video Studio MVP")
@@ -41,9 +80,26 @@ async def auth_error_handler(request, exc: AuthError):
     """Emit the shared AUTH_* contract so the frontend handler can act on it."""
     return JSONResponse(status_code=exc.status_code, content=to_response(exc))
 
+# The launcher picks a free port, so a hardcoded origin list would reject the UI
+# on every machine whose port moved. DARK_STUDIO_ALLOWED_ORIGINS is a
+# comma-separated override; the regex keeps every localhost port working even when
+# the list is customised.
+DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:8013", "http://localhost:8013"]
+LOCALHOST_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$"
+ALLOWED_ORIGINS_ENV = "DARK_STUDIO_ALLOWED_ORIGINS"
+
+
+def allowed_origins() -> List[str]:
+    """Origins from the environment, falling back to the historical pair."""
+    raw = os.getenv(ALLOWED_ORIGINS_ENV, "")
+    origins = [item.strip() for item in raw.split(",") if item.strip()]
+    return origins or list(DEFAULT_ALLOWED_ORIGINS)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8013", "http://localhost:8013"],
+    allow_origins=allowed_origins(),
+    allow_origin_regex=LOCALHOST_ORIGIN_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -69,6 +125,8 @@ class ApiSettings(BaseModel):
     gemini_api_key: str = ""
     openai_api_key: str = ""
     youtube_api_key: str = ""
+    azure_speech_key: str = ""
+    azure_speech_region: str = ""
 
 
 class StrategyRequest(BaseModel):
@@ -76,9 +134,427 @@ class StrategyRequest(BaseModel):
     transcript: str = ""
 
 
+class ScriptRequest(BaseModel):
+    topic: str
+    # Optional: when present the script is stored next to the project so
+    # POST /api/tts can narrate it without the UI resending the whole text.
+    project_name: str = ""
+    language: str = DEFAULT_LANGUAGE
+    section_count: int = 5
+    tone: str = "documentary"
+    duration_target: int = 60
+    custom_instructions: str = ""
+
+
+class TtsRequest(BaseModel):
+    project_name: str = "demo_project"
+    # Empty means "narrate the script stored for this project".
+    text: str = ""
+    voice: str = DEFAULT_VOICE
+    provider: str = "edge"
+    rate: str = "+0%"
+    volume: str = "+0%"
+    pitch: str = "+0Hz"
+
+
+SCRIPT_SUFFIX = ".script.json"
+
+# Narration pace, used for the estimate only; same figure as script_gen uses.
+WORDS_PER_SECOND = 2.5
+
+# Cap on a user music upload. The read is bounded so a hostile Content-Length
+# cannot turn into a huge allocation before the check runs.
+MAX_MUSIC_UPLOAD_BYTES = 20 * 1024 * 1024
+
+
+def _script_path(safe_name: str) -> Path:
+    return UPLOAD_DIR / f"{safe_name}{SCRIPT_SUFFIX}"
+
+
+def _store_script(safe_name: str, payload: Dict[str, Any]) -> bool:
+    """Persist a generated script for later narration. Never raises."""
+    try:
+        _script_path(safe_name).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _stored_script_text(safe_name: str) -> str:
+    """Narration text of the stored script, or "" when there is none.
+
+    Falls back to hook + sections when ``full_text`` is missing, and keeps the hook
+    because it is meant to be the first spoken line.
+    """
+    path = _script_path(safe_name)
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    full_text = str(data.get("full_text") or "").strip()
+    if full_text:
+        return full_text
+    parts: List[str] = []
+    hook = str(data.get("hook") or "").strip()
+    if hook:
+        parts.append(hook)
+    for section in data.get("sections") or []:
+        if isinstance(section, dict):
+            text = str(section.get("text") or "").strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts).strip()
+
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    """Form booleans arrive as strings; anything unrecognised keeps the default."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        folded = value.strip().casefold()
+        if folded in ("true", "1", "yes", "on"):
+            return True
+        if folded in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _parse_float(value: Any, default: float, low: float, high: float) -> Optional[float]:
+    """Clamp a numeric form field, or None when it is not a number at all."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN cannot survive a comparison
+        return None
+    return max(low, min(high, number))
+
+
+def _voice_payload(voice: Any) -> Dict[str, Any]:
+    """Serialise a VoiceInfo, tolerating a mapping or a bare id."""
+    if is_dataclass(voice) and not isinstance(voice, type):
+        return asdict(voice)
+    if isinstance(voice, Mapping):
+        return dict(voice)
+    return {
+        "id": str(voice),
+        "name": str(voice),
+        "gender": "unknown",
+        "locale": "",
+        "provider": "edge",
+    }
+
+
+def _track_payload(track: Any) -> Dict[str, Any]:
+    if is_dataclass(track) and not isinstance(track, type):
+        return asdict(track)
+    if isinstance(track, Mapping):
+        return dict(track)
+    return {"id": str(track)}
+
+
+def _renderer_accepts(renderer: Any, keyword: str) -> bool:
+    """Whether the renderer takes `keyword`, so an older engine still renders.
+
+    Inspected rather than caught: a TypeError raised *inside* the renderer would
+    otherwise trigger a second, partial render. A mock exposes a
+    ``(*args, **kwargs)`` signature, so a patched renderer receives the full set
+    of keywords and the tests can assert them exactly.
+    """
+    try:
+        parameters = inspect.signature(renderer).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return keyword in parameters
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "message": "Dark Video Studio MVP running"}
+
+
+@app.get("/api/languages")
+def list_languages():
+    """Narration languages the script generator supports."""
+    try:
+        return {"languages": get_languages(), "default": DEFAULT_LANGUAGE}
+    except Exception as exc:  # the picker must render even if the service breaks
+        return {"languages": [], "default": DEFAULT_LANGUAGE, "error": str(exc)}
+
+
+@app.post("/api/script")
+def create_script(request: ScriptRequest):
+    """Turn a topic into a narration script.
+
+    Synchronous on purpose: ``script_gen.generate_script`` is a sync function and
+    wrapping it in ``async def`` would block the event loop on the model call.
+    """
+    if not request.topic.strip():
+        raise HTTPException(status_code=400, detail="Indique um tema para gerar o guião.")
+    language = (request.language or "").strip()
+    if language not in LANGUAGES:
+        raise HTTPException(status_code=400, detail="Idioma de narração não suportado.")
+    if request.section_count < 1 or request.section_count > MAX_SECTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"O número de secções tem de estar entre 1 e {MAX_SECTIONS}.",
+        )
+    duration = max(MIN_DURATION, min(int(request.duration_target), MAX_DURATION))
+
+    try:
+        script = generate_script(
+            request.topic,
+            language=language,
+            section_count=request.section_count,
+            tone=request.tone,
+            duration_target=duration,
+            custom_instructions=request.custom_instructions,
+        )
+    except ValueError as exc:
+        # Blank topic / out-of-range section count, the only two the service raises.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422, detail=f"Não foi possível gerar o guião: {exc}"
+        ) from exc
+
+    payload = script.to_dict()
+    # A local script is a success, not an error, but the degradation has to be
+    # visible: "fallback-local" plus a non-null fallback_error say why.
+    payload["degraded"] = script.source == SOURCE_FALLBACK
+
+    safe_name = sanitize_name(request.project_name.strip())
+    if safe_name:
+        payload["project_name"] = safe_name
+        payload["stored"] = _store_script(safe_name, payload)
+    return payload
+
+
+@app.get("/api/voices")
+def get_voices(locale: str = ""):
+    """Voice catalogue, optionally narrowed to a locale prefix.
+
+    A locale with no match is an empty list, not an error: the picker simply
+    shows nothing for that language.
+    """
+    try:
+        voices = [_voice_payload(item) for item in list_voices(locale)]
+    except Exception:
+        voices = []
+    return {
+        "voices": voices,
+        "default": DEFAULT_VOICE,
+        "locale": (locale or "").strip(),
+        "providers": list(SUPPORTED_PROVIDERS),
+    }
+
+
+@app.get("/api/tts/status")
+def tts_status():
+    """Which narration providers can run right now.
+
+    Always 200: a missing optional package is a degraded capability the settings
+    panel renders, not a failed request.
+    """
+    try:
+        status = get_tts_status()
+        if not isinstance(status, dict):
+            raise ValueError("estado de TTS inesperado")
+        return status
+    except Exception as exc:
+        return {
+            "providers": {
+                name: {"available": False, "requires_key": name != "edge"}
+                for name in SUPPORTED_PROVIDERS
+            },
+            "default_voice": DEFAULT_VOICE,
+            "default_provider": "edge",
+            "voices": 0,
+            "ai_gateway": {},
+            "error": str(exc),
+        }
+
+
+@app.post("/api/tts")
+async def synthesize_narration(request: TtsRequest):
+    """Narrate a project and leave the audio + SRT the build-video flow expects."""
+    safe_name = sanitize_name(request.project_name.strip()) or "demo_project"
+
+    provider = (request.provider or "edge").strip().lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=400, detail="Fornecedor de voz não suportado.")
+
+    text = (request.text or "").strip()
+    if not text:
+        text = _stored_script_text(safe_name)
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Não há texto para narrar: envie `text` ou gere um guião primeiro.",
+        )
+
+    audio_path = UPLOAD_DIR / f"{safe_name}.mp3"
+    try:
+        await synthesize_speech_long(
+            text,
+            audio_path,
+            voice=request.voice,
+            provider=provider,
+            rate=request.rate,
+            volume=request.volume,
+            pitch=request.pitch,
+        )
+    except AuthError:
+        # Missing/rejected key, rate limit, upstream failure: re-raised so the
+        # shared handler emits the real status and the AUTH_* contract.
+        raise
+    except ValueError as exc:
+        # Bad voice id or empty text, both raised before any network call.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # edge-tts not installed, ffmpeg missing: actionable, not a user error.
+        raise HTTPException(
+            status_code=422, detail=f"Não foi possível gerar a narração: {exc}"
+        ) from exc
+
+    try:
+        segments = transcribe_audio_file(audio_path)
+        srt_file = UPLOAD_DIR / f"{safe_name}.srt"
+        srt_file.write_text(build_srt_from_segments(segments), encoding="utf-8")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # whisper/ffmpeg could not read the generated audio, so there are no
+        # usable subtitles; /api/build-video would fail later without them.
+        raise HTTPException(
+            status_code=422, detail=f"Não foi possível gerar as legendas: {exc}"
+        ) from exc
+
+    return {
+        "project_name": safe_name,
+        "audio_file": str(audio_path),
+        "srt_file": str(srt_file),
+        "segments": segments,
+        "voice": request.voice,
+        "provider": provider,
+        "characters": len(text),
+        "estimated_seconds": round(len(text.split()) / WORDS_PER_SECOND, 2),
+    }
+
+
+@app.get("/api/presets")
+def get_presets():
+    """Theme presets plus the closed vocabularies the caption controls offer."""
+    try:
+        presets = [preset.to_dict() for preset in list_presets()]
+    except Exception:
+        presets = []
+    return {
+        "presets": presets,
+        "positions": list(VALID_POSITIONS),
+        "modes": list(VALID_CAPTION_MODES),
+        "fonts": list(VALID_FONT_FAMILIES),
+    }
+
+
+@app.get("/api/music/tracks")
+def get_music_tracks(mood: str = ""):
+    """Music library, optionally filtered by mood."""
+    wanted = (mood or "").strip()
+    if wanted and wanted not in MOODS:
+        raise HTTPException(status_code=400, detail="Ambiente musical não suportado.")
+    try:
+        tracks = [_track_payload(item) for item in list_tracks(wanted)]
+    except Exception:
+        tracks = []
+    return {"tracks": tracks, "moods": list(MOODS), "mood": wanted}
+
+
+@app.get("/api/music/search")
+def search_music(q: str = ""):
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Indique um termo de pesquisa.")
+    try:
+        tracks = [_track_payload(item) for item in search_tracks(query)]
+    except Exception:
+        tracks = []
+    return {"tracks": tracks, "query": query}
+
+
+@app.post("/api/music/upload")
+async def upload_music(
+    file: UploadFile = File(...),
+    title: str = Form(""),
+    mood: str = Form("ambient"),
+):
+    """Register a user audio file in the music library."""
+    filename = file.filename or ""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in MUSIC_AUDIO_SUFFIXES:
+        raise HTTPException(
+            status_code=400, detail="Formato de áudio não suportado para música."
+        )
+
+    wanted_mood = (mood or "").strip() or "ambient"
+    if wanted_mood not in MOODS:
+        raise HTTPException(status_code=400, detail="Ambiente musical não suportado.")
+
+    content = await file.read(MAX_MUSIC_UPLOAD_BYTES + 1)
+    if len(content) > MAX_MUSIC_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Ficheiro de música demasiado grande.")
+    if not content:
+        raise HTTPException(status_code=400, detail="Ficheiro de música vazio.")
+
+    # Written under a random name: the caller's filename never reaches the
+    # filesystem, and register_upload still gets to slugify the title itself.
+    staged = UPLOAD_DIR / f"music_upload_{uuid.uuid4().hex}{suffix}"
+    try:
+        staged.write_bytes(content)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=422, detail="Não foi possível guardar o ficheiro de música."
+        ) from exc
+
+    try:
+        track = register_upload(staged, title=title, mood=wanted_mood)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422, detail="Não foi possível registar a música: " + str(exc)
+        ) from exc
+    finally:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    payload = _track_payload(track)
+    stored_path = Path(str(payload.get("path") or ""))
+    try:
+        inside = stored_path.resolve().is_relative_to(MUSIC_DIR.resolve())
+    except (OSError, ValueError):
+        inside = False
+    if not inside:
+        # register_upload slugifies, so this should be unreachable; refusing here
+        # keeps a future change in that slugifier from becoming a path traversal.
+        raise HTTPException(
+            status_code=400, detail="Nome de faixa inválido: o título não pode conter caminhos."
+        )
+    return {"status": "ok", "track": payload}
 
 
 @app.post("/api/transcribe")
@@ -114,11 +590,38 @@ async def build_video(
     storyboard_json: str = Form(""),
     aspect_ratio: str = Form("vertical"),
     topic: str = Form(""),
+    preset: str = Form(""),
+    subtitle_style: str = Form(""),
+    music_track: str = Form(""),
+    music_volume: str = Form(""),
+    duck_voice: str = Form("true"),
 ):
     safe_name = sanitize_name(project_name.strip()) or "demo_project"
     srt_path = UPLOAD_DIR / f"{safe_name}.srt"
     if not srt_path.exists():
         raise HTTPException(status_code=400, detail="Gere primeiro a transcrição deste projeto.")
+
+    # Parsed here rather than inside the renderer so a malformed payload is a 400
+    # with a readable message instead of a failed render.
+    style_payload = None
+    if subtitle_style.strip():
+        try:
+            style_payload = json.loads(subtitle_style)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status_code=400, detail="Estilo de legendas inválido: JSON malformado."
+            ) from exc
+        if not isinstance(style_payload, dict):
+            raise HTTPException(
+                status_code=400, detail="Estilo de legendas tem de ser um objecto JSON."
+            )
+
+    volume = _parse_float(music_volume, DEFAULT_MUSIC_VOLUME, 0.0, 1.0)
+    if volume is None:
+        raise HTTPException(
+            status_code=400, detail="O volume da música tem de ser um número entre 0 e 1."
+        )
+    duck = _parse_bool(duck_voice, True)
 
     audio_path = next(
         (item for item in sorted(UPLOAD_DIR.glob(f"{safe_name}.*")) if item.suffix.lower() in AUDIO_SUFFIXES),
@@ -175,13 +678,27 @@ async def build_video(
         None,
     )
     pool_urls = [item.get("url", "") for item in media_pool if item.get("url")]
+    wanted_render_kwargs = {
+        "media_pool": pool_urls,
+        "preset": preset.strip(),
+        "subtitle_style": style_payload,
+        "music_track": music_track.strip(),
+        "music_volume": volume,
+        "duck_voice": duck,
+    }
+    render_kwargs = {
+        name: value
+        for name, value in wanted_render_kwargs.items()
+        if _renderer_accepts(render_video_hyperframes, name)
+    }
     render_real = await render_video_hyperframes(
         safe_name, srt_path, storyboard, audio_path, aspect_ratio,
-        media_pool=pool_urls,
+        **render_kwargs,
     )
     render_real["edit_plan"] = edit_plan
     render_real["provider_status"] = get_provider_status()
 
+    track_info = get_track(music_track.strip()) if music_track.strip() else None
     return {
         "project_name": safe_name,
         "keywords": keywords,
@@ -196,6 +713,13 @@ async def build_video(
         "provider_status": get_provider_status(),
         "render": render_real,
         "render_real": render_real,
+        # Echoed so the UI can show what was actually applied to the render.
+        "preset": preset.strip(),
+        "subtitle_style": style_payload,
+        "music_track": music_track.strip(),
+        "music": _track_payload(track_info) if track_info is not None else None,
+        "music_volume": volume,
+        "duck_voice": duck,
     }
 
 
@@ -211,6 +735,19 @@ async def build_viral(
     srt_path = UPLOAD_DIR / f"{safe_name}.srt"
     if not srt_path.exists():
         raise HTTPException(status_code=400, detail="Gere primeiro a transcrição deste projeto.")
+
+    # Imported here, not at module scope: viral_pipeline needs librosa, and a
+    # top-level import made the entire app fail to start without it.
+    try:
+        from backend.services.viral_pipeline import render_viral_video
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "O pipeline viral precisa do pacote opcional 'librosa'. "
+                "Instale-o com 'pip install -r requirements.txt'."
+            ),
+        ) from exc
 
     result = await render_viral_video(
         safe_name, srt_path, aspect_ratio,
@@ -243,7 +780,27 @@ async def build_viral(
 
 @app.get("/api/providers")
 def get_providers():
-    return {"providers": get_provider_status()}
+    """Media/AI provider status, plus the narration providers for the same panel.
+
+    Guarded because it is the endpoint the settings page calls on load: an
+    optional dependency going missing must degrade the payload, not 500 it.
+    """
+    try:
+        providers = get_provider_status()
+    except Exception as exc:
+        providers = {"error": str(exc)}
+    try:
+        tts = get_tts_status()
+    except Exception as exc:
+        tts = {
+            "providers": {
+                name: {"available": False, "requires_key": name != "edge"}
+                for name in SUPPORTED_PROVIDERS
+            },
+            "default_voice": DEFAULT_VOICE,
+            "error": str(exc),
+        }
+    return {"providers": providers, "tts": tts}
 
 
 @app.post("/api/strategy")
@@ -301,6 +858,10 @@ def save_api_settings(settings: ApiSettings):
         "GEMINI_API_KEY": settings.gemini_api_key.strip() or os.getenv("GEMINI_API_KEY", ""),
         "OPENAI_API_KEY": settings.openai_api_key.strip() or os.getenv("OPENAI_API_KEY", ""),
         "YOUTUBE_API_KEY": settings.youtube_api_key.strip() or os.getenv("YOUTUBE_API_KEY", ""),
+        # Azure speech needs both halves; they are stored side by side so a saved
+        # key is never a regionless credential every request would reject.
+        "AZURE_SPEECH_KEY": settings.azure_speech_key.strip() or os.getenv("AZURE_SPEECH_KEY", ""),
+        "AZURE_SPEECH_REGION": settings.azure_speech_region.strip() or os.getenv("AZURE_SPEECH_REGION", ""),
     }
     env_path = Path(__file__).resolve().parents[1] / ".env"
     env_path.write_text("\n".join(f"{key}={value}" for key, value in values.items()) + "\n", encoding="utf-8")

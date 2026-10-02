@@ -1,9 +1,39 @@
+# Segredos
 .env
-storage/uploads/*
-storage/outputs/*
-storage/media/*
-__pycache__/
-*.pyc
+.env.*
+!.env.example
+
+# Ambientes Python
 .venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (o render HyperFrames corre via npx)
 node_modules/
+
+# Agentes / tooling local
+.kilo/worktrees/
+.agent-manager/
+*.log
+
+# Conteudo gerado pelo utilizador.
+# As pastas em si sao versionadas com .gitkeep, para que a estrutura exista
+# num clone novo; o conteudo nunca e versionado.
+storage/media/*
+storage/outputs/*
+storage/uploads/*
+storage/thumbnails/*
+storage/music/*
+# Resquicios de testes que ficaram tracked por engano (ex.: *.html de thumbnails).
+storage/thumbnails/
+storage/**/*.html
+
+# Excecoes que mantem a estrutura do storage no git.
+!storage/README.md
+!**/.gitkeep

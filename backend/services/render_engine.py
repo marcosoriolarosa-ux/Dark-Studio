@@ -4,6 +4,9 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import json
 import subprocess
+# Bound directly: the mixer catches these by type, and a test may swap the
+# subprocess module out from under us to simulate a missing ffmpeg.
+from subprocess import SubprocessError
 import asyncio
 import os
 import tempfile
@@ -21,6 +24,15 @@ from backend.services.pipeline import (
     parse_srt_to_segments,
 )
 from backend.services.asset_quality import looks_padded
+from backend.services import music
+from backend.services.style import (
+    VALID_CAPTION_MODES,
+    SubtitleStyle,
+    align_for_position,
+    get_preset,
+    resolve_preset_and_style,
+    valid_choice,
+)
 
 import sys
 HYPERFRAMES_CLI = "npx.cmd" if sys.platform == "win32" else "npx"
@@ -140,6 +152,69 @@ _TRANSITIONS_CSS = """
         """
 
 
+# The static variant rules below (.caption.hook .caption-text and friends) are
+# two classes deep, so a bare ".caption-text" rule can never outrank them no
+# matter where it lands in the sheet. A configured style therefore repeats that
+# exact specificity for every caption variant - same selector shape, later in
+# the document - which lets the user's typography win without !important.
+# "hidden" is absent because that variant emits no caption element at all.
+_CAPTION_VARIANTS: tuple[str, ...] = ("bottom", "center", "hook", "karaoke")
+_CAPTION_CONTAINER_SELECTORS = ", ".join(f".caption.{name}" for name in _CAPTION_VARIANTS)
+_CAPTION_TEXT_SELECTORS = ", ".join(
+    f".caption.{name} .caption-text" for name in _CAPTION_VARIANTS
+)
+
+
+def build_subtitle_css(style: SubtitleStyle) -> str:
+    """The CSS a configured :class:`SubtitleStyle` contributes to the composition.
+
+    Two rules, both interpolated raw into the ``<style>`` block and both safe by
+    construction: ``style.to_css()`` returns bare allowlisted tokens (no braces,
+    semicolons, quotes, newlines or ``url()`` payloads), and the container rule
+    carries only an ``align-items`` keyword from ``align_for_position``.
+
+    The block is emitted *after* ``_TRANSITIONS_CSS`` and mirrors the variant
+    selectors' specificity, so a configured size/colour/stroke actually wins
+    over the hardcoded hook and karaoke variants.
+    """
+    declarations = "; ".join(
+        f"{prop}: {value}" for prop, value in style.to_css().items()
+    )
+    align = align_for_position(style.position)
+    return (
+        f"{_CAPTION_CONTAINER_SELECTORS} {{ align-items: {align}; }}\n"
+        f"{_CAPTION_TEXT_SELECTORS} {{ {declarations}; }}"
+    )
+
+
+def apply_preset_to_storyboard(
+    storyboard: List[Dict[str, Any]], preset: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Return copies of *storyboard* restyled by *preset*; the input is untouched.
+
+    A scene's own ``background`` is an explicit authorial choice and always
+    wins; only scenes that carry none get a colour from the preset palette,
+    cycled by scene index so consecutive frames never repeat. ``transition`` and
+    ``effect`` are preset-owned by definition, so they are set unconditionally -
+    a preset is a look, not a suggestion.
+
+    With no preset name the scenes come back as plain copies, which is what
+    keeps an unconfigured render byte-identical to the pre-preset output.
+    """
+    scenes: List[Dict[str, Any]] = [dict(scene) for scene in storyboard or []]
+    if not preset or not isinstance(preset, str) or not preset.strip():
+        return scenes
+
+    resolved = get_preset(preset)
+    palette = resolved.palette or []
+    for idx, scene in enumerate(scenes):
+        if palette and not str(scene.get("background") or "").strip():
+            scene["background"] = palette[idx % len(palette)]
+        scene["transition"] = resolved.transition
+        scene["effect"] = resolved.effect
+    return scenes
+
+
 def get_dimensions(aspect_ratio: str) -> tuple[int, int]:
     dimensions = {
         "vertical": (1080, 1920),
@@ -255,6 +330,14 @@ _WIPE = 0.7
 _GRAIN_STEP = 0.5
 _GRAIN_POSITIONS = 8
 
+# ffprobe only has to read a stream list, so it gets a short leash; the ffmpeg
+# mix re-reads the whole file and is allowed a long one.
+_FFPROBE_TIMEOUT = 60
+_MIX_TIMEOUT = 900
+# 192 kbps AAC is transparent enough for a narration-plus-bed mix and keeps the
+# stream well under the 200 kbps where audible artefacts show up.
+_MIX_AUDIO_BITRATE = "192k"
+
 VIDEO_EXTENSIONS = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm", ".m4v": "video/mp4"}
 IMAGE_EXTENSIONS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".bmp": "image/bmp"}
 
@@ -361,14 +444,54 @@ def generate_composition_html(
     audio_ref: Optional[str],
     aspect_ratio: str,
     total_duration: float,
+    *,
+    preset: Optional[str] = None,
+    subtitle_style: Optional[dict] = None,
 ) -> str:
+    """Build the HyperFrames composition for one render.
+
+    ``preset`` and ``subtitle_style`` are optional and keyword-only, so every
+    existing caller keeps working untouched. When neither is supplied the output
+    is unchanged from before styling existed: no extra CSS is emitted, the
+    opening frame keeps its "hook" promotion, and the storyboard is used as-is.
+
+    When either is supplied the look is authored: the preset palette and
+    transition are applied to copies of the scenes, the caption typography comes
+    from the resolved style, its ``mode`` becomes the default caption variant
+    and its ``position`` becomes the container alignment. A scene's own
+    ``caption_style`` still wins over that default - that is how the viral
+    pipeline puts karaoke on scene 0 and plain captions everywhere else.
+    """
     width, height = get_dimensions(aspect_ratio)
+
+    # "Configured" means the caller asked for a look, not merely that a default
+    # style exists: resolve_preset_and_style always returns a value, so only the
+    # presence of a preset name or a style dict can switch the styled path on.
+    styled = bool(preset) or isinstance(subtitle_style, dict)
+    resolved_preset, style = resolve_preset_and_style(preset, subtitle_style)
+    scenes = apply_preset_to_storyboard(storyboard, preset)
+    default_mode = style.mode
+
+    # The styled block is interpolated raw (style.py guarantees every value is
+    # inert) and its explanatory comment lives here, in the generated HTML,
+    # because a comment inside a value is what trips the renderer's fragile CSS
+    # parser. When unstyled this is the empty string, so the surrounding template
+    # stays byte-identical to the pre-styling output.
+    subtitle_css = ""
+    if styled:
+        subtitle_css = (
+            "\n        /* Configurable caption styling. Every value below is "
+            "validated by style.py and safe to interpolate raw; no data-URI may "
+            "appear here, because the renderer parser fails on the encoded "
+            "quotes it would need. */\n        "
+            + build_subtitle_css(style)
+        )
 
     scene_clips: List[str] = []
     caption_clips: List[str] = []
     animations: List[str] = []
 
-    for idx, scene in enumerate(storyboard):
+    for idx, scene in enumerate(scenes):
         start, duration = _scene_times(scene, idx)
         scene_id = escape_html(f"scene-{idx}")
         background = str(scene.get("background", "#0f172a") or "#0f172a")
@@ -385,18 +508,28 @@ def generate_composition_html(
             f'style="background:{escape_html(background)};">{inner}</div>'
         )
 
-        has_next = idx + 1 < len(storyboard)
-        next_start = float(storyboard[idx + 1]["start"]) if has_next else 0.0
+        has_next = idx + 1 < len(scenes)
+        next_start = float(scenes[idx + 1]["start"]) if has_next else 0.0
         animations.extend(
             _scene_media_animations(idx, start, duration, effect, has_next, next_start)
         )
 
         caption = str(scene.get("caption") or scene.get("headline") or "").strip()
-        caption_style = str(scene.get("caption_style", "bottom") or "bottom")
-        words = scene.get("words") or []
-        if idx == 0 and caption_style == "bottom":
-            # The opening frame is the hook: bigger, centred, uppercase.
+        # A scene's own caption_style is a deliberate per-scene override and wins
+        # over the configured style's mode; an unknown value falls back to that
+        # mode rather than landing in the markup as an arbitrary class name.
+        scene_mode = str(scene.get("caption_style") or "").strip()
+        caption_style = (
+            valid_choice(scene_mode, VALID_CAPTION_MODES, default_mode)
+            if scene_mode
+            else default_mode
+        )
+        if not styled and idx == 0 and caption_style == "bottom":
+            # Legacy hook default: with no style configured the opening frame is
+            # the hook, so an unconfigured project renders exactly as it always
+            # has. Once a look is configured, its mode decides instead.
             caption_style = "hook"
+        words = scene.get("words") or []
         if caption and caption_style != "hidden":
             if caption_style == "karaoke" and words:
                 # Join with a space: inline-block spans otherwise run together.
@@ -450,7 +583,8 @@ def generate_composition_html(
 
     # The CSS block is interpolated raw: escaping it would corrupt the grain
     # texture, and Python comments must stay outside the template because an
-    # f-string emits everything literally.
+    # f-string emits everything literally. {subtitle_css} is empty unless a
+    # look was configured, so an unstyled render is unchanged byte for byte.
     html = f"""<!doctype html>
 <html lang="pt-BR">
 <head>
@@ -462,7 +596,7 @@ def generate_composition_html(
         html, body {{ width: 100%; height: 100%; overflow: hidden; background: #05070b; }}
         body {{ font-family: 'Segoe UI', Tahoma, Arial, sans-serif; }}
         #root {{ position: relative; width: 100%; height: 100%; overflow: hidden; background: #05070b; }}
-        {_TRANSITIONS_CSS}
+        {_TRANSITIONS_CSS}{subtitle_css}
     </style>
 </head>
 <body>
@@ -581,6 +715,246 @@ async def render_with_hyperframes(
         raise RuntimeError("npx not found. Please install Node.js and npm.") from exc
 
 
+def _has_audio_stream(video_path: Path) -> Optional[bool]:
+    """True/False when ffprobe could answer, None when it could not.
+
+    The distinction matters: a video with no audio track must get the music as
+    its sole audio rather than a failed mix, but a probe that simply could not
+    run must not be mistaken for "no audio" - the caller retries that case with
+    the audio graph first.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_FFPROBE_TIMEOUT,
+        )
+    except (OSError, ValueError, SubprocessError):
+        return None
+    if probe.returncode != 0:
+        return None
+    return any(line.strip() for line in (probe.stdout or "").splitlines())
+
+
+def _music_chain(params: Dict[str, Any], duration: float) -> str:
+    """The music branch of the mix graph: level, filter and edge fades.
+
+    The library peak-normalises every track to -3 dBFS, so a linear
+    ``music_volume`` of 0.18 lands the bed near the -18 dBFS target the mixer
+    contract names. The 8 kHz lowpass keeps it a bed rather than a lead, and the
+    fades mean it never starts or stops abruptly under the voice.
+    """
+    volume = float(params["music_volume"])
+    fade_in = min(float(params["fade_in"]), max(0.0, duration) * 0.4)
+    fade_out = min(float(params["fade_out"]), max(0.0, duration) * 0.4)
+    fade_start = max(0.0, max(0.0, duration) - fade_out)
+    return (
+        f"volume={volume:.4f},"
+        f"{params['filter']},"
+        f"afade=t=in:st=0:d={fade_in:.3f},"
+        f"afade=t=out:st={fade_start:.3f}:d={fade_out:.3f}"
+    )
+
+
+def _ducked_mix_filter(params: Dict[str, Any], duration: float) -> str:
+    """Full two-input graph: the music bed ducked by the narration.
+
+    One ffmpeg call, one filter graph. The voice is split because it is both the
+    mix input and the sidechain key; ``normalize=0`` on the amix keeps the voice
+    at its own level instead of halving both stems, and the trailing alimiter
+    puts the mix ceiling at the contract's voice target so nothing clips.
+    """
+    ceiling = 10 ** (float(params["voice_target_db"]) / 20.0)
+    graph = (
+        f"[0:a]asplit=2[voice][key];"
+        f"[1:a]{_music_chain(params, duration)}[bed];"
+        # Sidechain keys off the voice, so the music dips under speech and
+        # recovers in the gaps: threshold 0.05 linear (~-26 dBFS), 8:1.
+        f"[bed][key]sidechaincompress=threshold=0.05:ratio=8:attack=15:release=350[ducked];"
+        f"[voice][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];"
+        f"[mixed]alimiter=limit={ceiling:.4f}[out]"
+    )
+    return graph
+
+
+def _music_only_filter(params: Dict[str, Any], duration: float) -> str:
+    """Graph for a video with no audio track: the music becomes the audio."""
+    ceiling = 10 ** (float(params["voice_target_db"]) / 20.0)
+    return f"{_music_chain(params, duration)},alimiter=limit={ceiling:.4f}"
+
+
+def mix_audio_track(
+    video_path: Path,
+    music_path: Optional[Path],
+    output_path: Path,
+    *,
+    music_volume: float = music.DEFAULT_MUSIC_VOLUME,
+    duck_voice: bool = True,
+    total_duration: Optional[float] = None,
+) -> Path:
+    """Mix a music bed under a rendered video's existing audio, in one ffmpeg call.
+
+    HyperFrames has already muxed the narration into the MP4, so the bed is a
+    post-process: levels come from ``music.mix_parameters`` and the track is
+    stretched to cover the video with ``music.loop_to_duration`` so a 40s track
+    still beds a 90s cut. With ``duck_voice`` the music is keyed off the narration
+    through ``sidechaincompress``; a video with no audio track gets the music as
+    its sole audio instead of a failed mix.
+
+    Video is stream-copied, never re-encoded. Every failure - no ffmpeg, no
+    music, a non-zero exit, an unwritable output - returns the ORIGINAL
+    ``video_path`` untouched: music is a bonus, never a reason to lose a render.
+    """
+    video = Path(video_path)
+    output = Path(output_path)
+    if music_path is None:
+        return video
+    track = Path(music_path)
+    if not video.exists() or not track.exists():
+        return video
+
+    params = music.mix_parameters(music_volume, duck_voice)
+    if float(params["music_volume"]) <= 0.0:
+        # Zero means "no bed", which is exactly what the caller already has.
+        return video
+
+    duration = 0.0
+    for candidate in (total_duration, get_media_duration(video)):
+        try:
+            duration = float(candidate or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration > 0.0:
+            break
+
+    has_audio = _has_audio_stream(video)
+    plans: List[List[str]] = []
+    if has_audio is not False:
+        # Also the fallback for an unprobeable file: tried first, retried without
+        # audio below, so a missing stream costs one extra call at worst.
+        graph = _ducked_mix_filter(params, duration) if params["duck_voice"] else (
+            "[0:a]asplit=2[voice][key];"
+            f"[1:a]{_music_chain(params, duration)}[bed];"
+            f"[voice][bed]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mixed];"
+            f"[mixed]alimiter=limit={10 ** (float(params['voice_target_db']) / 20.0):.4f}[out]"
+        )
+        plans.append([
+            "ffmpeg", "-v", "error", "-y",
+            "-i", str(video), "-i", str(track),
+            "-filter_complex", graph,
+            "-map", "0:v:0", "-map", "[out]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", _MIX_AUDIO_BITRATE,
+            "-shortest", str(output),
+        ])
+    if has_audio is not True:
+        plans.append([
+            "ffmpeg", "-v", "error", "-y",
+            "-i", str(video), "-i", str(track),
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-af", _music_only_filter(params, duration),
+            "-c:v", "copy", "-c:a", "aac", "-b:a", _MIX_AUDIO_BITRATE,
+            "-shortest", str(output),
+        ])
+
+    for command in plans:
+        # Written to a sibling temp file and moved into place, so a failed mix can
+        # never leave a truncated file where the caller expects the output.
+        staged = output.with_name(output.stem + ".mixing" + output.suffix)
+        command[-1] = str(staged)
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True,
+                           timeout=_MIX_TIMEOUT)
+            if not staged.exists() or staged.stat().st_size == 0:
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(staged), str(output))
+            return output
+        except (OSError, ValueError, SubprocessError):
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+            continue
+    return video
+
+
+def _apply_background_music(
+    video_path: Path,
+    music_track: Optional[str],
+    music_volume: float,
+    duck_voice: bool,
+    total_duration: float,
+) -> tuple[Path, Dict[str, Any]]:
+    """Mix *music_track* into *video_path* and report what happened.
+
+    Returns the path to use (the original when nothing was mixed) plus the
+    ``music`` payload block. Never raises: an unknown track id, an unusable file
+    or a missing ffmpeg all come back as ``applied: False`` with a note naming
+    the reason, because a render that succeeded must never be thrown away over a
+    missing background bed.
+    """
+    report: Dict[str, Any] = {
+        "requested": music_track or None,
+        "applied": False,
+        "track_id": None,
+        "volume": float(music_volume),
+        "duck_voice": bool(duck_voice),
+        "note": "",
+    }
+    if not music_track:
+        return video_path, report
+
+    try:
+        track = music.get_track(music_track)
+    except Exception:  # pragma: no cover - music.py is total, belt and braces
+        track = None
+    if track is None:
+        report["note"] = f"musica ignorada: trilha '{music_track}' nao encontrada."
+        return video_path, report
+
+    report["track_id"] = track.id
+    source = Path(track.path)
+    if not source.exists():
+        report["note"] = f"musica ignorada: arquivo da trilha '{track.id}' indisponivel."
+        return video_path, report
+
+    try:
+        with tempfile.TemporaryDirectory(dir=str(OUTPUT_DIR)) as tmpdir:
+            tmp = Path(tmpdir)
+            # loop_to_duration covers a track shorter than the cut with one
+            # ffmpeg call and degrades to a copy when the track is long enough.
+            bed = music.loop_to_duration(source, total_duration, tmp / "music-bed.wav")
+            mixed = mix_audio_track(
+                video_path,
+                Path(bed),
+                tmp / "mixed.mp4",
+                music_volume=music_volume,
+                duck_voice=duck_voice,
+                total_duration=total_duration,
+            )
+            if mixed == video_path or not Path(mixed).exists():
+                report["note"] = (
+                    "musica nao aplicada: ffmpeg indisponivel ou mixagem falhou; "
+                    "o video foi mantido sem trilha."
+                )
+                return video_path, report
+            os.replace(str(mixed), str(video_path))
+    except Exception as exc:  # noqa: BLE001 - the render must survive anything
+        report["note"] = f"musica nao aplicada: {exc}"
+        return video_path, report
+
+    report["applied"] = True
+    report["note"] = f"trilha '{track.id}' misturada em {total_duration:.1f}s."
+    return video_path, report
+
+
 async def render_video_hyperframes(
     project_name: str,
     srt_path: Path,
@@ -589,11 +963,25 @@ async def render_video_hyperframes(
     aspect_ratio: str = "vertical",
     output_stem: str | None = None,
     media_pool: Optional[List[str]] = None,
+    *,
+    preset: Optional[str] = None,
+    subtitle_style: Optional[dict] = None,
+    music_track: Optional[str] = None,
+    music_volume: float = music.DEFAULT_MUSIC_VOLUME,
+    duck_voice: bool = True,
 ) -> Dict[str, Any]:
     """Render a project to MP4.
 
     ``output_stem`` keeps derived renders (e.g. the shorts cut) from overwriting the
     main video for the same project.
+
+    ``preset``/``subtitle_style`` shape the composition; ``music_track`` (an id
+    from ``music.list_tracks``), ``music_volume`` and ``duck_voice`` shape a
+    background bed mixed in after HyperFrames has produced the MP4. Music is
+    strictly a post-process and never fatal: a missing track or a missing ffmpeg
+    still returns ``status="rendered"`` with ``music.applied = False`` and a note
+    explaining why. The payload always carries ``preset``, the resolved
+    ``subtitle_style`` and the ``music`` block, on success and on error alike.
     """
     stem = output_stem or project_name
     output_path = OUTPUT_DIR / f"{stem}.mp4"
@@ -628,8 +1016,14 @@ async def render_video_hyperframes(
         project_name, storyboard, audio_path, project_dir / "assets", media_pool
     )
 
+    # Resolved once here so the reported style is exactly the one the
+    # composition was built from; resolution is pure, so the call inside
+    # generate_composition_html reaches the same answer.
+    resolved_preset, resolved_style = resolve_preset_and_style(preset, subtitle_style)
+
     composition_html = generate_composition_html(
-        stem, storyboard, media_refs, audio_ref, aspect_ratio, total_duration
+        stem, storyboard, media_refs, audio_ref, aspect_ratio, total_duration,
+        preset=preset, subtitle_style=subtitle_style,
     )
 
     width, height = get_dimensions(aspect_ratio)
@@ -640,6 +1034,15 @@ async def render_video_hyperframes(
         )
         cleanup_render_dirs(keep=project_dir)
 
+        video_duration = get_media_duration(output_path)
+
+        # The music stage runs only after a successful render: the narration is
+        # already muxed into the MP4 by HyperFrames, so the bed is laid over the
+        # finished file and the result replaces it atomically.
+        output_path, music_report = _apply_background_music(
+            output_path, music_track, music_volume, duck_voice,
+            float(video_duration or 0.0) or float(total_duration or 0.0),
+        )
         video_duration = get_media_duration(output_path)
 
         payload = {
@@ -658,6 +1061,9 @@ async def render_video_hyperframes(
             "video_duration": video_duration,
             "message": "Vídeo renderizado com HyperFrames com sucesso.",
             "render_engine": "hyperframes",
+            "preset": resolved_preset.name,
+            "subtitle_style": resolved_style.to_dict(),
+            "music": music_report,
         }
     except Exception as e:
         payload = {
@@ -666,6 +1072,16 @@ async def render_video_hyperframes(
             "status": "error",
             "error": str(e),
             "message": f"Falha no render HyperFrames: {e}",
+            "preset": resolved_preset.name,
+            "subtitle_style": resolved_style.to_dict(),
+            "music": {
+                "requested": music_track or None,
+                "applied": False,
+                "track_id": None,
+                "volume": float(music_volume),
+                "duck_voice": bool(duck_voice),
+                "note": "musica nao aplicada: o render falhou antes da mixagem.",
+            },
         }
 
     summary_file = OUTPUT_DIR / f"{stem}.json"
