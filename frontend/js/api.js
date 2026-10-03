@@ -174,7 +174,13 @@ export const searchMedia = (text, provider = 'pexels', signal) =>
     { signal },
   );
 export const getGenerateJob = (jobId, signal) =>
-  apiJson(`/api/generate/${encodeURIComponent(jobId)}`, { signal, silent: true });
+  apiJson(`/api/jobs/${encodeURIComponent(jobId)}`, { signal, silent: true });
+
+/**
+ * Job history. The one endpoint that answers with a bare JSON array instead of
+ * an envelope object, so a caller must not read a `.jobs` key off the result.
+ */
+export const listJobs = (signal) => apiJson('/api/jobs', { signal, silent: true });
 
 export const createScript = (payload, signal) =>
   apiJson('/api/script', { method: 'POST', json: payload, signal });

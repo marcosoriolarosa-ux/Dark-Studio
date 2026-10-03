@@ -4,11 +4,11 @@ import json
 import os
 import re
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, fields as dataclass_fields, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -71,6 +71,9 @@ from backend.services.pipeline import (
 from backend.services.render_engine import render_video_hyperframes
 from backend.services.shorts_pipeline import generate_shorts, list_highlights
 from backend.services.auth_contract import AuthError, to_response
+# The one-click orchestrator. Imported as a module on purpose: the job registry is
+# module-level state, so every read and write has to go through the same object.
+from backend.services import generator
 
 app = FastAPI(title="Dark Video Studio MVP")
 
@@ -776,6 +779,89 @@ async def build_viral(
         "render_engine": "hyperframes",
         "message": "Vídeo viral pronto: beat-sync, loop contínuo, thumbnail otimizado, metadados de plataforma.",
     }
+
+
+# ------------------------------------------------------------ one-click generation
+# GenerationRequest is the single source of truth for what a job accepts, so the
+# allowed key set is read off the dataclass at import time rather than written
+# out by hand: a new field is picked up automatically and a renamed one cannot
+# leave a stale literal behind.
+GENERATION_PARAM_FIELDS: frozenset[str] = frozenset(
+    field.name for field in dataclass_fields(generator.GenerationRequest)
+)
+
+
+def _generation_params(payload: Any) -> Dict[str, Any]:
+    """Keep only the keys GenerationRequest declares, dropping the rest.
+
+    submit_job does ``GenerationRequest(**params)``, so a single stray key from an
+    older or hand-rolled client (mood, project_name, ...) would come back as a
+    TypeError. Filtering here makes those requests run on defaults instead of
+    failing, which is the difference between a 202 and a 400 for a client we do
+    not control.
+    """
+    if not isinstance(payload, Mapping):
+        return {}
+    return {
+        key: value
+        for key, value in payload.items()
+        if key in GENERATION_PARAM_FIELDS
+    }
+
+
+@app.post("/api/generate", status_code=202)
+async def submit_generation(payload: Dict[str, Any] = Body(default_factory=dict)):
+    """Queue a whole topic -> video run and answer immediately with the job.
+
+    The body is taken raw instead of through a Pydantic model on purpose: the
+    dataclass in generator.py is the real contract, and a model would either
+    duplicate it or turn a missing topic into a 422 before the Portuguese
+    message can be shown.
+
+    async def on purpose: submit_job schedules the pipeline on the running event
+    loop, so a sync route would run it in a threadpool with no loop and the job
+    would sit queued forever. The reply is the only thing this call produces - the
+    client polls GET /api/jobs/{job_id} for progress.
+    """
+    try:
+        job = generator.submit_job(_generation_params(payload))
+    except ValueError as exc:
+        # Blank topic, unknown preset, out-of-range section count: a user
+        # mistake, reported with the Portuguese message the service produced.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        # Anything else is our bug, not the caller. Say so in pt-PT instead of
+        # leaking a bare traceback-shaped body.
+        raise HTTPException(
+            status_code=500, detail=f"Falha ao enfileirar a geração: {exc}"
+        ) from exc
+    return JSONResponse(status_code=202, content=job.to_dict())
+
+
+@app.get("/api/jobs")
+def list_generation_jobs():
+    """Every known job as a bare list, newest first (the history panel polls this)."""
+    return JSONResponse(content=[job.to_dict() for job in generator.list_jobs()])
+
+
+@app.get("/api/jobs/{job_id}")
+def get_generation_job(job_id: str):
+    job = generator.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    return JSONResponse(content=job.to_dict())
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_generation_job(job_id: str):
+    """Cancel a job that has not started yet; a running one always reports false.
+
+    The 404 is separate from the cancel result on purpose: an unknown id is a
+    client bug, a job that is already running is a documented limitation.
+    """
+    if generator.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job não encontrado.")
+    return {"cancelled": generator.cancel_job(job_id)}
 
 
 @app.get("/api/providers")

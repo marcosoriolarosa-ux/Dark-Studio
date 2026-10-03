@@ -1,7 +1,7 @@
 /*
  * Dark Studio - generator.js
  * The one-click pipeline controller: POST /api/generate, then poll
- * GET /api/generate/{job_id} until the job completes or fails.
+ * GET /api/jobs/{job_id} until the job completes or fails.
  *
  * This is deliberately the only place that knows about the job contract, so
  * the orchestration can move from the UI to a server-side route without

@@ -1,6 +1,10 @@
 /*
  * Dark Studio - views/settings.js
- * Every key in .env.example, in the shape POST /api/settings accepts.
+ * Every key in .env.example, in the shape POST /api/settings accepts: the
+ * ApiSettings model in backend/app.py names every one of them `*_api_key`, so
+ * `field` carries that exact body key and `id` stays the short name the DOM
+ * and presence() use. Sending `id` used to look right and save nothing, because
+ * Pydantic drops a key the model does not declare.
  *
  * A key value is never read back into the DOM: the inputs are empty and say
  * only whether the server reports the key as present. Sending an empty string
@@ -16,15 +20,15 @@ import * as api from '../api.js';
 import { loadPresets } from '../catalog.js';
 
 const KEYS = [
-  { id: 'openrouter', label: 'OPENROUTER_API_KEY', group: 'Modelo editorial', why: 'Escreve os guioes. Sem ela o servidor usa o modelo local.', env: 'OPENROUTER_API_KEY' },
-  { id: 'openrouter_model', label: 'OPENROUTER_MODEL', group: 'Modelo editorial', why: 'Tem de terminar em :free.', env: 'OPENROUTER_MODEL', text: true },
-  { id: 'pexels', label: 'PEXELS_API_KEY', group: 'Stock media', why: 'Imagens de fundo para as cenas.', env: 'PEXELS_API_KEY' },
-  { id: 'pixabay', label: 'PIXABAY_API_KEY', group: 'Stock media', why: 'Alternativa ao Pexels.', env: 'PIXABAY_API_KEY' },
-  { id: 'gemini', label: 'GEMINI_API_KEY', group: 'Fornecedores alternativos', why: 'Opcional.', env: 'GEMINI_API_KEY' },
-  { id: 'openai', label: 'OPENAI_API_KEY', group: 'Fornecedores alternativos', why: 'Opcional.', env: 'OPENAI_API_KEY' },
-  { id: 'youtube', label: 'YOUTUBE_API_KEY', group: 'Fornecedores alternativos', why: 'So para analise de metadados.', env: 'YOUTUBE_API_KEY' },
-  { id: 'azure_speech_key', label: 'AZURE_SPEECH_KEY', group: 'Sintese de voz', why: 'Com a regiao, a Azure passa a ser preferida.', env: 'AZURE_SPEECH_KEY' },
-  { id: 'azure_speech_region', label: 'AZURE_SPEECH_REGION', group: 'Sintese de voz', why: 'Ex.: westeurope.', env: 'AZURE_SPEECH_REGION', text: true },
+  { id: 'openrouter', field: 'openrouter_api_key', label: 'OPENROUTER_API_KEY', group: 'Modelo editorial', why: 'Escreve os guioes. Sem ela o servidor usa o modelo local.' },
+  { id: 'openrouter_model', field: 'openrouter_model', label: 'OPENROUTER_MODEL', group: 'Modelo editorial', why: 'Tem de terminar em :free.', text: true },
+  { id: 'pexels', field: 'pexels_api_key', label: 'PEXELS_API_KEY', group: 'Stock media', why: 'Imagens de fundo para as cenas.' },
+  { id: 'pixabay', field: 'pixabay_api_key', label: 'PIXABAY_API_KEY', group: 'Stock media', why: 'Alternativa ao Pexels.' },
+  { id: 'gemini', field: 'gemini_api_key', label: 'GEMINI_API_KEY', group: 'Fornecedores alternativos', why: 'Opcional.' },
+  { id: 'openai', field: 'openai_api_key', label: 'OPENAI_API_KEY', group: 'Fornecedores alternativos', why: 'Opcional.' },
+  { id: 'youtube', field: 'youtube_api_key', label: 'YOUTUBE_API_KEY', group: 'Fornecedores alternativos', why: 'So para analise de metadados.' },
+  { id: 'azure_speech_key', field: 'azure_speech_key', label: 'AZURE_SPEECH_KEY', group: 'Sintese de voz', why: 'Com a regiao, a Azure passa a ser preferida.' },
+  { id: 'azure_speech_region', field: 'azure_speech_region', label: 'AZURE_SPEECH_REGION', group: 'Sintese de voz', why: 'Ex.: westeurope.', text: true },
 ];
 
 export async function render(root, ctx) {
@@ -162,7 +166,7 @@ export async function render(root, ctx) {
     clear(resultBox);
     resultBox.appendChild(skeletonStack(1));
     const payload = {};
-    for (const item of KEYS) payload[item.id] = inputs[item.id] ? inputs[item.id].value.trim() : '';
+    for (const item of KEYS) payload[item.field] = inputs[item.id] ? inputs[item.id].value.trim() : '';
     try {
       const data = await api.saveSettings(payload, ctx.signal);
       clear(resultBox);
