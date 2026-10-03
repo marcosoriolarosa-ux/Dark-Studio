@@ -43,8 +43,12 @@ def detect_beats(audio_path: Path) -> Dict[str, Any]:
         y, sr = librosa.load(str(audio_path), sr=None)
         tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr, units="time")
         beats = beat_frames.tolist()
+        # librosa.beat.beat_track returns tempo as a 1-element ndarray in newer
+        # versions (numpy 2.x with librosa 1.0.0), not a scalar float, so a plain
+        # float(tempo) raises TypeError. atleast_1d handles both scalar and array.
+        tempo_value = float(np.atleast_1d(tempo)[0])
         return {
-            "tempo": float(tempo),
+            "tempo": tempo_value,
             "beats": beats,
             "beat_count": len(beats),
             "duration": float(len(y) / sr),
