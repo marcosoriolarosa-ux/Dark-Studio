@@ -158,6 +158,7 @@ def fake_pipeline(monkeypatch, tmp_path):
         # Record the kwargs the orchestrator handed us so the test can assert
         # the render stage wires preset/subtitle/music through unchanged.
         _fake_render.last_kwargs = dict(kwargs)
+        await asyncio.sleep(0)  # yield so tests can observe RUNNING state
         return _render_result()
 
     _fake_render.last_kwargs = {}
@@ -270,8 +271,10 @@ class TestHappyPath:
         monkeypatch.setattr(gen, "_stage", _record)
         job = gen.submit_job({"topic": "dinheiro"})
         _run(job.job_id)
+        # New lifecycle includes an initial "starting" stage before the actual script stage
         assert seen == [
-            ("script", gen.PROGRESS_SCRIPT),
+            ("script", gen.PROGRESS_SCRIPT),  # "A iniciar..." - job becomes RUNNING
+            ("script", gen.PROGRESS_SCRIPT),  # "A gerar o guião..." - actual script generation
             ("voice", gen.PROGRESS_VOICE),
             ("media", gen.PROGRESS_MEDIA),
             ("render", gen.PROGRESS_RENDER),
@@ -392,6 +395,169 @@ class TestCancellation:
     def test_cancelling_an_unknown_job_returns_false(self, fake_pipeline):
         assert gen.cancel_job("does-not-exist") is False
 
+
+
+# --------------------------------------------------------------- running lifecycle
+
+class TestRunningLifecycle:
+    def test_job_stays_queued_while_waiting_for_slot(self, fake_pipeline, monkeypatch):
+        """A job behind the concurrency cap stays QUEUED until it acquires a slot."""
+        # Reduce concurrency to 1 to make queuing deterministic
+        monkeypatch.setattr(gen, "MAX_CONCURRENT_JOBS", 1)
+        gen.reset_for_tests()
+
+        # Submit two jobs; the second must wait
+        job1 = gen.submit_job({"topic": "primeiro"})
+        job2 = gen.submit_job({"topic": "segundo"})
+
+        # Both start as queued
+        assert gen.get_job(job1.job_id).status == "queued"
+        assert gen.get_job(job2.job_id).status == "queued"
+
+        # Run both jobs concurrently in the same event loop
+        async def run_both():
+            task1 = asyncio.create_task(gen._run_job(job1.job_id))
+            # Give job1 time to acquire the slot and become RUNNING
+            for _ in range(50):
+                j1 = gen.get_job(job1.job_id)
+                if j1 and j1.status == "running":
+                    break
+                await asyncio.sleep(0)
+            else:
+                raise AssertionError("job1 did not become running")
+
+            # job1 should now be RUNNING, job2 should still be QUEUED
+            assert gen.get_job(job1.job_id).status == "running"
+            assert gen.get_job(job2.job_id).status == "queued"
+
+            # Start job2 (it will queue behind job1)
+            task2 = asyncio.create_task(gen._run_job(job2.job_id))
+
+            # Wait for job1 to complete
+            await task1
+            assert gen.get_job(job1.job_id).status == "completed"
+
+            # Now job2 should be able to acquire the slot
+            for _ in range(50):
+                j2 = gen.get_job(job2.job_id)
+                if j2 and j2.status == "running":
+                    break
+                await asyncio.sleep(0)
+            else:
+                raise AssertionError("job2 did not become running after job1 completed")
+
+            assert gen.get_job(job2.job_id).status == "running"
+
+            # Wait for job2 to complete
+            await task2
+            assert gen.get_job(job2.job_id).status == "completed"
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run_both())
+        finally:
+            loop.close()
+
+    def test_at_most_max_concurrent_jobs_running(self, fake_pipeline, monkeypatch):
+        """With MAX_CONCURRENT_JOBS = 2, at most 2 jobs are RUNNING simultaneously."""
+        monkeypatch.setattr(gen, "MAX_CONCURRENT_JOBS", 2)
+        gen.reset_for_tests()
+
+        running_counts = []
+
+        # Wrap _run_job to track concurrent running jobs
+        original_run_job = gen._run_job
+
+        async def tracking_run_job(job_id):
+            running_counts.append(len(gen._running_ids))
+            return await original_run_job(job_id)
+
+        monkeypatch.setattr(gen, "_run_job", tracking_run_job)
+
+        # Submit 5 jobs and run them all concurrently
+        jobs = [gen.submit_job({"topic": f"tema {i}"}) for i in range(5)]
+
+        async def run_all():
+            tasks = [asyncio.create_task(gen._run_job(job.job_id)) for job in jobs]
+            await asyncio.gather(*tasks)
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run_all())
+        finally:
+            loop.close()
+
+        # Check that at no point were more than 2 jobs running
+        assert all(count <= 2 for count in running_counts), f"Concurrency violated: {running_counts}"
+        # At least once we should have seen 2 running (when jobs overlap)
+        assert max(running_counts) == 2, f"Expected peak concurrency of 2, got {max(running_counts)}"
+
+    def test_cancel_job_returns_false_for_running_job(self, fake_pipeline, monkeypatch):
+        """cancel_job returns False for a RUNNING job and does not corrupt state."""
+        monkeypatch.setattr(gen, "MAX_CONCURRENT_JOBS", 1)
+        gen.reset_for_tests()
+
+        job = gen.submit_job({"topic": "dinheiro"})
+
+        async def run_and_test_cancel():
+            task = asyncio.create_task(gen._run_job(job.job_id))
+
+            # Wait for it to become RUNNING
+            for _ in range(50):
+                j = gen.get_job(job.job_id)
+                if j and j.status == "running":
+                    break
+                await asyncio.sleep(0)
+            else:
+                raise AssertionError("job did not become running")
+
+            # Try to cancel - should return False
+            assert gen.cancel_job(job.job_id) is False
+
+            # Job should still be RUNNING (not corrupted)
+            assert gen.get_job(job.job_id).status == "running"
+
+            # Wait for completion
+            await task
+
+            # Job should complete normally
+            assert gen.get_job(job.job_id).status == "completed"
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run_and_test_cancel())
+        finally:
+            loop.close()
+
+    def test_happy_path_passes_through_running(self, fake_pipeline):
+        """The happy path goes QUEUED -> RUNNING -> COMPLETED."""
+        job = gen.submit_job({"topic": "dinheiro"})
+        assert job.status == "queued"
+
+        async def run_and_check():
+            task = asyncio.create_task(gen._run_job(job.job_id))
+
+            # Wait for RUNNING - check immediately, then poll
+            for _ in range(50):
+                j = gen.get_job(job.job_id)
+                if j and j.status == "running":
+                    break
+                await asyncio.sleep(0)  # yield immediately to let task run
+            else:
+                raise AssertionError("job did not become running")
+
+            assert gen.get_job(job.job_id).status == "running"
+
+            # Wait for completion
+            await task
+
+            assert gen.get_job(job.job_id).status == "completed"
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run_and_check())
+        finally:
+            loop.close()
 
 # ------------------------------------------------------------- concurrency cap
 

@@ -51,11 +51,18 @@ def stub_pipeline():
     The stub never touches the job, which leaves it QUEUED: that is what makes the
     cancellation test deterministic, since a job that never starts is exactly the
     one cancel_job is allowed to stop.
+
+    We also patch _run_job to not actually execute, so the job stays QUEUED
+    instead of transitioning to RUNNING -> COMPLETED instantly.
     """
     async def _stub(job):
         return {}
 
-    with mock.patch.object(generator, "run_generation", _stub):
+    async def _no_run(job_id):
+        # Do nothing - job stays queued forever
+        pass
+
+    with mock.patch.object(generator, "run_generation", _stub),          mock.patch.object(generator, "_run_job", _no_run):
         yield
 
 

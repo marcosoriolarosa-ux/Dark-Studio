@@ -37,6 +37,14 @@ function stageKeyOf(job) {
   if (!job) return 'idle';
   if (job.status === 'completed') return 'done';
   if (job.status === 'queued') return 'idle';
+  if (job.status === 'running') {
+    // Running jobs map to their actual pipeline stage
+    if (stage.includes('script') || stage.includes('guiao') || stage.includes('guión')) return 'script';
+    if (stage.includes('tts') || stage.includes('voice') || stage.includes('voz') || stage.includes('audio')) return 'tts';
+    if (stage.includes('media') || stage.includes('image') || stage.includes('asset')) return 'media';
+    if (stage.includes('render') || stage.includes('compose') || stage.includes('compos')) return 'render';
+    return 'script';
+  }
   if (stage.includes('script') || stage.includes('guiao') || stage.includes('guión')) return 'script';
   if (stage.includes('tts') || stage.includes('voice') || stage.includes('voz') || stage.includes('audio')) return 'tts';
   if (stage.includes('media') || stage.includes('image') || stage.includes('asset')) return 'media';
@@ -85,7 +93,7 @@ export function createGeneratorPanel(ctx, { onUnavailable } = {}) {
         el('span', { text: label }),
         el('span', {
           class: 'stage-time',
-          text: name === 'done' ? 'ok' : (name === 'active' && status === 'queued' ? 'fila' : ''),
+          text: name === 'done' ? 'ok' : (name === 'active' && status === 'queued' ? 'fila' : name === 'active' && status === 'running' ? 'a correr' : ''),
         }),
       ]));
     });

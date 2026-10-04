@@ -15,9 +15,9 @@ Concurrency
 
 Cancellation
     There is no shared kill switch. cancel_job only prevents a *not-yet-started*
-    job from running; a RUNNING job runs to completion. That is a documented
-    limitation, not a hidden one: cancelling mid-render would leave a half-written
-    MP4 on disk.
+    job (status QUEUED) from running; a RUNNING job runs to completion and
+    cannot be cancelled. That is a documented limitation, not a hidden one:
+    cancelling mid-render would leave a half-written MP4 on disk.
 
 Degrade, never crash
     Any stage failure is caught, recorded on the job as state=FAILED with a
@@ -382,9 +382,10 @@ def cancel_job(job_id: str) -> bool:
     """Cooperative cancellation.
 
     Returns True when the job was still QUEUED and is now CANCELLED (it will
-    never start). Returns False when the job does not exist, is already RUNNING
-    (cancelling mid-render is not possible - it would leave a half-written MP4),
-    or has already finished. The caller can retry after the job settles.
+    never start). Returns False when the job does not exist, is RUNNING (a
+    running job cannot be cancelled - it would leave a half-written MP4), or has
+    already finished (COMPLETED/FAILED/CANCELLED). The caller can retry after the
+    job settles.
     """
     job = _jobs.get(job_id)
     if job is None:
@@ -489,6 +490,8 @@ async def _run_job(job_id: str) -> None:
         if job is None or job.status != "queued":
             return
         _running_ids.add(job_id)
+        job.status = "running"
+        _stage(job, "script", PROGRESS_SCRIPT, "A iniciar...")
         try:
             result = await run_generation(job)
         except Exception as exc:  # last-resort: never let a worker die silently
