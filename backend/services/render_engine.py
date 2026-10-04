@@ -1,3 +1,17 @@
+"""HyperFrames rendering: composition HTML, the render subprocess, the music mix.
+
+One setting reaches every machine: ``DARK_STUDIO_RENDER_TIMEOUT`` (seconds,
+default 900) bounds how long a single ``npx hyperframes render`` may run before
+its whole process tree is killed. It is read from the environment on every call
+(:func:`render_timeout_seconds`), never at import time, so a test or an operator
+can override it without restarting anything.
+
+The default is deliberately generous - 900s, not 120s - because a real render
+legitimately runs for minutes: ~316s measured for a 41s 1080x1920 cut (1237
+frames at ~3.9 fps) on a 2-vCPU box, and slower hardware scales from there. The
+watchdog exists to catch a wedged chrome/ffmpeg and to let the server shut down,
+not to police render speed, so it must never cut a healthy slow render short.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +23,7 @@ import subprocess
 from subprocess import SubprocessError
 import asyncio
 import os
+import signal
 import tempfile
 import shutil
 
@@ -334,6 +349,16 @@ _GRAIN_POSITIONS = 8
 # mix re-reads the whole file and is allowed a long one.
 _FFPROBE_TIMEOUT = 60
 _MIX_TIMEOUT = 900
+# Watchdog for the HyperFrames render itself, in seconds, read from the
+# environment on every call so a test or an operator can retune it without
+# restarting the server. See render_timeout_seconds() for the reasoning.
+_RENDER_TIMEOUT_ENV = "DARK_STUDIO_RENDER_TIMEOUT"
+DEFAULT_RENDER_TIMEOUT = 900.0
+# How long a terminated render gets to die before it is killed outright, and
+# how long taskkill is allowed to take on Windows. Both bound a cleanup path,
+# so they must be short.
+_KILL_GRACE_SECONDS = 5.0
+_TASKKILL_TIMEOUT = 15.0
 # 192 kbps AAC is transparent enough for a narration-plus-bed mix and keeps the
 # stream well under the 200 kbps where audible artefacts show up.
 _MIX_AUDIO_BITRATE = "192k"
@@ -693,6 +718,177 @@ def cleanup_render_dirs(keep: Optional[Path] = None) -> int:
     return removed
 
 
+def _is_windows() -> bool:
+    """True on Windows, where process control is done by ``taskkill``, not signals."""
+    return sys.platform == "win32"
+
+
+def render_timeout_seconds() -> float:
+    """Seconds one render may run before the watchdog tears its tree down.
+
+    Read from ``DARK_STUDIO_RENDER_TIMEOUT`` on *every* call rather than once at
+    import, so a test can shrink the budget and an operator can raise it without
+    the value being frozen into the module graph. An unset, blank, unparseable
+    or non-positive value falls back to :data:`DEFAULT_RENDER_TIMEOUT`.
+
+    The default has to clear a real render with room to spare, not a plausible
+    one: ~316s measured here for a 41s 1080x1920 cut (1237 frames at ~3.9 fps)
+    on a 2-vCPU box, and slower hardware or a longer cut scales from there.
+    900s is roughly three times that measurement, so the watchdog only ever
+    catches a genuinely wedged chrome/ffmpeg - never a valid slow render.
+    """
+    raw = os.environ.get(_RENDER_TIMEOUT_ENV)
+    if raw is None:
+        return DEFAULT_RENDER_TIMEOUT
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_RENDER_TIMEOUT
+    return value if value > 0 else DEFAULT_RENDER_TIMEOUT
+
+
+def _discard_partial_output(output_path: Path, existed_before: bool) -> None:
+    """Delete the truncated MP4 an abandoned render left behind.
+
+    Only when this render created the file. A previous good render of the same
+    project sits at this exact path, and losing a finished video because a later
+    attempt timed out would be a far worse failure than the timeout itself.
+    """
+    if existed_before:
+        return
+    try:
+        if output_path.exists():
+            output_path.unlink()
+    except OSError:
+        pass
+
+
+async def _wait_for_exit(proc: Any, timeout: float) -> bool:
+    """Wait up to *timeout* seconds for *proc* to be reaped; True when it exited."""
+    try:
+        await asyncio.wait_for(proc.wait(), timeout)
+        return True
+    except asyncio.TimeoutError:
+        return False
+    except (AttributeError, OSError, ValueError):
+        # An object that cannot be waited on (a stub, an already-reaped child)
+        # leaves nothing running that this function could usefully wait for.
+        return True
+
+
+def _process_group_id(proc: Any) -> Optional[int]:
+    """The child's process-group id, or None when it cannot be read."""
+    try:
+        return os.getpgid(proc.pid)
+    except (AttributeError, OSError):
+        return None
+
+
+def _signal_process_group(proc: Any, pgid: Optional[int], sig: int) -> None:
+    """Signal the whole render group, falling back to the direct child."""
+    try:
+        if pgid is None:
+            proc.send_signal(sig)
+        else:
+            os.killpg(pgid, sig)
+    except (AttributeError, OSError):
+        pass
+
+
+async def _kill_posix_process_tree(proc: Any, *, grace: float = _KILL_GRACE_SECONDS) -> None:
+    """SIGTERM the render's whole process group, then SIGKILL what is left.
+
+    The render is ``npx`` plus several ``chrome-headless-shell`` children plus
+    ffmpeg. Signalling only the direct child orphans the browser and leaves
+    ffmpeg encoding into a file nobody is waiting for; the spawn site starts the
+    child in its own session precisely so ``os.killpg`` can reach all of them.
+    The group id is read rather than assumed to equal the pid.
+    """
+    pgid = _process_group_id(proc)
+    _signal_process_group(proc, pgid, signal.SIGTERM)
+    if await _wait_for_exit(proc, grace):
+        return
+    _signal_process_group(proc, pgid, signal.SIGKILL)
+    await _wait_for_exit(proc, _KILL_GRACE_SECONDS)
+
+
+async def _run_taskkill(proc: Any) -> None:
+    """Run ``taskkill /PID <pid> /T /F`` hidden; never raises.
+
+    ``/T`` walks the process tree, which is the whole point: ``Process.kill()``
+    on Windows terminates only the process it was handed. ``/F`` is required
+    because chrome does not honour a console terminate. Async so the event loop
+    keeps running while the render is being torn down.
+    """
+    command = ["taskkill", "/PID", str(proc.pid), "/T", "/F"]
+    try:
+        # CREATE_NO_WINDOW keeps a console-less server from flashing a window;
+        # getattr keeps the call constructible (and testable) off Windows.
+        killer = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        await asyncio.wait_for(killer.wait(), _TASKKILL_TIMEOUT)
+    except (AttributeError, OSError, ValueError, asyncio.TimeoutError):
+        pass
+
+
+async def _kill_windows_process_tree(proc: Any, *, grace: float = _KILL_GRACE_SECONDS) -> None:
+    """Graceful ``terminate()`` first, then ``taskkill /T /F`` for the tree."""
+    try:
+        proc.terminate()
+    except (AttributeError, OSError):
+        pass
+    if await _wait_for_exit(proc, grace):
+        return
+    await _run_taskkill(proc)
+    await _wait_for_exit(proc, _KILL_GRACE_SECONDS)
+
+
+def _force_kill_process(proc: Any) -> None:
+    """Synchronous backstop: SIGKILL the group (POSIX) or the child (Windows).
+
+    Runs from :func:`_kill_process_tree`'s ``finally`` because the awaits in the
+    platform helpers can be cancelled a second time during a shutdown, and a
+    kill that never landed is precisely the leak this exists to prevent. On
+    Windows only the direct child can be signalled synchronously, but by then
+    ``taskkill /T`` has already had its turn at the tree.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if _is_windows():
+            proc.kill()
+            return
+        pgid = _process_group_id(proc)
+        if pgid is None:
+            proc.kill()
+        else:
+            os.killpg(pgid, signal.SIGKILL)
+    except (AttributeError, OSError):
+        pass
+
+
+async def _kill_process_tree(proc: Any, *, grace: float = _KILL_GRACE_SECONDS) -> None:
+    """Terminate the render and everything it spawned, then reap it.
+
+    The platform choice goes through :func:`_is_windows` rather than an inline
+    ``os.name`` check so both branches are reachable from a Linux test run.
+    Returns immediately for a process that has already exited.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if _is_windows():
+            await _kill_windows_process_tree(proc, grace=grace)
+        else:
+            await _kill_posix_process_tree(proc, grace=grace)
+    finally:
+        _force_kill_process(proc)
+
+
 async def render_with_hyperframes(
     project_name: str,
     composition_html: str,
@@ -701,10 +897,33 @@ async def render_with_hyperframes(
     width: int,
     height: int,
 ) -> Dict[str, Any]:
+    """Run the HyperFrames render under a watchdog and reap it either way.
+
+    The wait for the subprocess used to be a bare ``await proc.communicate()``
+    with no bound and no cancellation handling. A render legitimately needs
+    minutes (~316s for a 41s 1080x1920 cut here), so a client that walked away
+    left chrome and ffmpeg busy for the full run, two renders ended up racing for
+    the same project files, and the server could not shut down. Now the wait is
+    bounded by :func:`render_timeout_seconds` and both the timeout and
+    ``asyncio.CancelledError`` kill the whole tree - see
+    :func:`_kill_process_tree` - so nothing is left running and no half-written
+    MP4 is ever reported as ``status="rendered"``.
+    """
     (project_dir / "index.html").write_text(composition_html, encoding="utf-8")
+
+    timeout = render_timeout_seconds()
+    # Remembered so an abandoned render can drop the MP4 it half-wrote without
+    # ever deleting a previous good render of the same project.
+    output_existed = output_path.exists()
 
     try:
         # exec with an argument list, not a shell string: no quoting surprises.
+        spawn_kwargs: Dict[str, Any] = {}
+        if not _is_windows():
+            # Its own session makes npx a process-group leader, which is the
+            # only handle that reaches chrome-headless-shell and ffmpeg later.
+            # POSIX-only: Windows rejects start_new_session outright.
+            spawn_kwargs["start_new_session"] = True
         proc = await asyncio.create_subprocess_exec(
             HYPERFRAMES_CLI,
             "--yes",
@@ -715,8 +934,30 @@ async def render_with_hyperframes(
             cwd=str(project_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **spawn_kwargs,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError as exc:
+            await _kill_process_tree(proc)
+            # A run that actually finished inside the race window keeps its file;
+            # one the watchdog cut short does not, because a truncated MP4 that
+            # looks like a deliverable is worse than no file at all.
+            if proc.returncode != 0:
+                _discard_partial_output(output_path, output_existed)
+            raise RuntimeError(
+                f"tempo limite de render excedido ({timeout:.0f}s). O render foi "
+                f"encerrado; reduza a duracao do video ou aumente "
+                f"{_RENDER_TIMEOUT_ENV}."
+            ) from exc
+        except asyncio.CancelledError:
+            # CancelledError derives from BaseException, so the caller's
+            # "except Exception" never sees it - and must not. Kill the tree and
+            # re-raise: swallowing a shutdown would leave chrome running.
+            await _kill_process_tree(proc)
+            if proc.returncode != 0:
+                _discard_partial_output(output_path, output_existed)
+            raise
 
         if proc.returncode != 0:
             raise RuntimeError(f"HyperFrames render failed: {stderr.decode(errors='replace')}")
@@ -1019,6 +1260,10 @@ async def render_video_hyperframes(
     still returns ``status="rendered"`` with ``music.applied = False`` and a note
     explaining why. The payload always carries ``preset``, the resolved
     ``subtitle_style`` and the ``music`` block, on success and on error alike.
+
+    A render that outruns ``DARK_STUDIO_RENDER_TIMEOUT`` is killed and reported
+    like any other failure - ``status="error"`` carrying a Portuguese message -
+    never as a half-finished video.
     """
     stem = output_stem or project_name
     output_path = OUTPUT_DIR / f"{stem}.mp4"

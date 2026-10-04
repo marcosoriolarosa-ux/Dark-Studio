@@ -16,6 +16,14 @@ BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 REQUIRED_STRATEGY_FIELDS = {"angle", "hook", "titles", "visual_direction", "chapters"}
 
+# /api/build-video runs a real HyperFrames render: npx + chrome-headless-shell +
+# ffmpeg. One 41s 1080x1920 cut was measured at ~316s on a 2-vCPU box, and CI or
+# a laptop under load is slower still. The old 120s budget was the TEST being
+# wrong, not the endpoint: the render returns 200 given long enough. Do not
+# tighten this without timing a real render on a slow machine first - the fix for
+# an unbounded render is the server's watchdog, not a shorter client timeout.
+BUILD_VIDEO_TIMEOUT = 900
+
 
 def _wait_for_server(timeout=30):
     deadline = time.time() + timeout
@@ -206,16 +214,19 @@ class TestBuildVideo:
         resp = requests.post(
             f"{base_url}/api/build-video",
             data={"project_name": "api_test3"},
-            timeout=120,
+            timeout=BUILD_VIDEO_TIMEOUT,
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
 
     def test_build_video_response_structure(self, base_url):
         resp = requests.post(
             f"{base_url}/api/build-video",
             data={"project_name": "api_test3"},
-            timeout=120,
+            timeout=BUILD_VIDEO_TIMEOUT,
         )
+        # Status first: a non-JSON error body must fail here as a readable
+        # mismatch, not one line later as a confusing JSONDecodeError.
+        assert resp.status_code == 200, resp.text
         data = resp.json()
         assert data["project_name"] == "api_test3"
         assert "storyboard" in data

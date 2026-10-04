@@ -594,8 +594,13 @@ class TestSrtRoundTrip:
 # stage can fail without ever losing a render.
 # --------------------------------------------------------------------------
 
-import asyncio  # noqa: E402  (kept next to the tests that use it)
+import asyncio  # noqa: E402  (kept next to the tests that use them)
+import os  # noqa: E402
+import pathlib  # noqa: E402
+import signal  # noqa: E402
 import subprocess  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
 
 from backend.services.style import SubtitleStyle, get_preset, preset_names  # noqa: E402
 from backend.services.render_engine import (  # noqa: E402
@@ -1100,3 +1105,580 @@ class TestRenderPayloadCarriesTheNewKeys:
         assert result["music"]["applied"] is False
         assert result["music"]["volume"] == 0.3
         assert result["music"]["note"]
+
+
+class TestRenderWatchdogIsBounded:
+    """A render must not be able to pin the server process forever.
+
+    The subprocess used to be awaited with a bare ``await proc.communicate()``:
+    no bound, no cancellation handling, nothing able to stop chrome once the
+    HTTP client had given up. These tests fake the subprocess - no HyperFrames,
+    no multi-minute render - and assert the properties the fix depends on: the
+    wait is bounded, the whole tree is killed, a cancellation propagates, and a
+    timeout degrades into the ordinary Portuguese failure payload.
+    """
+
+    def _engine(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        return engine
+
+    def _stub_exec(self, monkeypatch, engine, proc):
+        """Swap the spawn call so no npx or chrome is ever launched."""
+        calls = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append((list(args), kwargs))
+            return proc
+
+        monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", fake_exec)
+        return calls
+
+    def _kill_recorder(self, monkeypatch, engine):
+        """Replace the tree killer and record what it was asked to kill."""
+        killed = []
+
+        async def fake_kill(proc, **kwargs):
+            killed.append((proc, kwargs))
+
+        monkeypatch.setattr(engine, "_kill_process_tree", fake_kill)
+        return killed
+
+    def _render(self, engine, tmp_path, stem, proc):
+        output = tmp_path / f"{stem}.mp4"
+        return engine.render_with_hyperframes(
+            stem, "<html></html>", output, tmp_path, 1080, 1920
+        )
+
+    # ----------------------------------------------------------------- happy path
+
+    def test_a_render_that_finishes_in_time_returns_the_same_dict(
+        self, monkeypatch, tmp_path
+    ):
+        engine = self._engine(monkeypatch, tmp_path)
+        output = tmp_path / "proj.mp4"
+        proc = _FakeProc(stdout=b"rendered 41s", returncode=0)
+        self._stub_exec(monkeypatch, engine, proc)
+        output.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+        result = asyncio.run(self._render(engine, tmp_path, "proj", proc))
+
+        assert result == {
+            "status": "rendered",
+            "output_path": str(output),
+            "stdout": "rendered 41s",
+        }, "the success payload must be unchanged by the watchdog"
+
+    def test_a_render_that_exits_cleanly_is_never_signalled(
+        self, monkeypatch, tmp_path
+    ):
+        """Paying the tree-kill cost on every successful render is not the fix."""
+        engine = self._engine(monkeypatch, tmp_path)
+        proc = _FakeProc(stdout=b"", returncode=0)
+        self._stub_exec(monkeypatch, engine, proc)
+        killed = self._kill_recorder(monkeypatch, engine)
+        (tmp_path / "proj.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+        asyncio.run(self._render(engine, tmp_path, "proj", proc))
+
+        assert killed == []
+        assert proc.signals == []
+        assert not proc.terminated and not proc.killed
+
+    def test_the_render_is_spawned_in_its_own_session_on_posix(
+        self, monkeypatch, tmp_path
+    ):
+        """start_new_session is what makes the whole tree killable later on."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        proc = _FakeProc(stdout=b"", returncode=0)
+        calls = self._stub_exec(monkeypatch, engine, proc)
+        (tmp_path / "proj.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+        asyncio.run(self._render(engine, tmp_path, "proj", proc))
+
+        _argv, kwargs = calls[0]
+        assert kwargs.get("start_new_session") is True, (
+            "without its own session npx leads no group and killpg cannot reach chrome"
+        )
+
+    def test_start_new_session_is_never_passed_on_windows(self, monkeypatch, tmp_path):
+        """Windows rejects the kwarg outright, so the branch must not reach it."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        proc = _FakeProc(stdout=b"", returncode=0)
+        calls = self._stub_exec(monkeypatch, engine, proc)
+        (tmp_path / "proj.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+        asyncio.run(self._render(engine, tmp_path, "proj", proc))
+
+        _argv, kwargs = calls[0]
+        assert "start_new_session" not in kwargs
+
+    # ------------------------------------------------------------------- timeout
+
+    def test_a_render_over_the_timeout_never_reports_success(
+        self, monkeypatch, tmp_path
+    ):
+        """The user gets the ordinary Portuguese failure, not a traceback."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "stage_project_assets", lambda *a, **k: ({}, None, []))
+        monkeypatch.setattr(engine, "get_media_duration", lambda _p: 5.0)
+        monkeypatch.setattr(engine, "cleanup_render_dirs", lambda keep=None: 0)
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "0.05")
+        proc = _FakeProc(returncode=None, hang=True)
+        self._stub_exec(monkeypatch, engine, proc)
+        killed = self._kill_recorder(monkeypatch, engine)
+        srt = tmp_path / "proj5.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+
+        result = asyncio.run(engine.render_video_hyperframes("proj5", srt))
+
+        assert result["status"] == "error", "a killed render must never read as rendered"
+        assert "tempo limite de render excedido" in result["message"], (
+            f"a timeout must read like any other render failure, got: {result['message']}"
+        )
+        assert "Falha no render HyperFrames" in result["message"]
+        # The error payload keeps the contract every caller relies on.
+        assert result["music"]["applied"] is False
+        assert isinstance(result["subtitle_style"], dict)
+        assert len(killed) == 1 and killed[0][0] is proc, (
+            "the tree killer must be called once, with the render process itself"
+        )
+
+    def test_a_timed_out_render_leaves_no_half_written_mp4(
+        self, monkeypatch, tmp_path
+    ):
+        """A truncated MP4 at the output path looks like a finished deliverable."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "0.05")
+        output = tmp_path / "proj6.mp4"
+        proc = _FakeProc(returncode=None, hang=True)
+        proc.writes_output = output
+        self._stub_exec(monkeypatch, engine, proc)
+        self._kill_recorder(monkeypatch, engine)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(self._render(engine, tmp_path, "proj6", proc))
+
+        assert not output.exists(), "the aborted render must not advertise an MP4"
+
+    def test_a_previous_render_is_never_deleted_by_a_later_timeout(
+        self, monkeypatch, tmp_path
+    ):
+        """Every render of a project shares this exact output path."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "0.05")
+        output = tmp_path / "proj7.mp4"
+        output.write_bytes(b"\x00\x00\x00\x18ftypmp42goodvideo")
+        proc = _FakeProc(returncode=None, hang=True)
+        proc.writes_output = output
+        self._stub_exec(monkeypatch, engine, proc)
+        self._kill_recorder(monkeypatch, engine)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(self._render(engine, tmp_path, "proj7", proc))
+
+        assert output.exists(), "losing a finished video is worse than the timeout"
+
+    # -------------------------------------------------------------- cancellation
+
+    def test_cancellation_kills_the_tree_and_propagates(self, monkeypatch, tmp_path):
+        """CancelledError is a BaseException: it must not be absorbed."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "600")
+        proc = _FakeProc(returncode=None, hang=True)
+        self._stub_exec(monkeypatch, engine, proc)
+        killed = self._kill_recorder(monkeypatch, engine)
+
+        async def main():
+            task = asyncio.ensure_future(self._render(engine, tmp_path, "proj8", proc))
+            await asyncio.sleep(0.05)  # let the spawn and the wait start
+            task.cancel()
+            return await task
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(main())
+
+        assert len(killed) == 1 and killed[0][0] is proc, (
+            "cancellation must kill the render tree before propagating"
+        )
+        assert not (tmp_path / "proj8.mp4").exists()
+
+    def test_a_cancelled_render_is_not_turned_into_a_payload(self, monkeypatch, tmp_path):
+        """render_video_hyperframes must not answer a cancelled render at all."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setattr(engine, "stage_project_assets", lambda *a, **k: ({}, None, []))
+        monkeypatch.setattr(engine, "get_media_duration", lambda _p: 5.0)
+        monkeypatch.setattr(engine, "cleanup_render_dirs", lambda keep=None: 0)
+        srt = tmp_path / "proj9.srt"
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+
+        async def cancelled(*args, **kwargs):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(engine, "render_with_hyperframes", cancelled)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(engine.render_video_hyperframes("proj9", srt))
+
+        assert not (tmp_path / "proj9.json").exists(), (
+            "a cancelled render must not leave a summary that reads as finished"
+        )
+
+    # -------------------------------------------------------------- the bound
+
+    def test_the_bound_is_read_from_the_environment_at_call_time(self, monkeypatch):
+        """A value frozen at import time is what made the watchdog untunable."""
+        engine = render_engine_module()
+        monkeypatch.delenv("DARK_STUDIO_RENDER_TIMEOUT", raising=False)
+        assert engine.render_timeout_seconds() == engine.DEFAULT_RENDER_TIMEOUT
+
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "42")
+        assert engine.render_timeout_seconds() == 42.0
+
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "1200")
+        assert engine.render_timeout_seconds() == 1200.0
+
+    def test_the_default_clears_a_real_slow_render(self):
+        """~316s was measured for a 41s 1080x1920 cut on a 2-vCPU box."""
+        engine = render_engine_module()
+        assert engine.DEFAULT_RENDER_TIMEOUT >= 900.0, (
+            "a watchdog tighter than the measured render kills valid work"
+        )
+
+    @pytest.mark.parametrize("raw", ["", "   ", "abc", "0", "-5"])
+    def test_a_nonsense_timeout_falls_back_to_the_default(self, monkeypatch, raw):
+        engine = render_engine_module()
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", raw)
+        assert engine.render_timeout_seconds() == engine.DEFAULT_RENDER_TIMEOUT
+
+    def test_the_environment_value_is_the_bound_the_wait_uses(
+        self, monkeypatch, tmp_path
+    ):
+        """Not just the helper: the value has to reach asyncio.wait_for."""
+        engine = self._engine(monkeypatch, tmp_path)
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "0.05")
+        proc = _FakeProc(returncode=None, hang=True)
+        self._stub_exec(monkeypatch, engine, proc)
+
+        bounds = []
+        real_wait_for = engine.asyncio.wait_for
+
+        def recording_wait_for(awaitable, timeout, *args, **kwargs):
+            bounds.append(timeout)
+            return real_wait_for(awaitable, timeout, *args, **kwargs)
+
+        monkeypatch.setattr(engine.asyncio, "wait_for", recording_wait_for)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(self._render(engine, tmp_path, "proj11", proc))
+
+        assert bounds and bounds[0] == 0.05, (
+            f"the render wait must be bounded by the env value, saw {bounds}"
+        )
+
+
+class TestKillHelpers:
+    """The tree-kill decision logic, exercised with mocked process objects.
+
+    Real Windows process killing cannot run on Linux, so what is under test is
+    the decision: which platform branch is taken, whether the whole group (and
+    not merely the direct child) is signalled, and whether SIGTERM escalates to
+    SIGKILL.
+    """
+
+    def _fast_grace(self, monkeypatch, engine):
+        """Shrink the post-SIGTERM patience so the escalation is instant.
+
+        The helper reads ``_KILL_GRACE_SECONDS`` at call time for its second
+        wait; the first one arrives as the ``grace`` argument, which the tests
+        pass explicitly.
+        """
+        monkeypatch.setattr(engine, "_KILL_GRACE_SECONDS", 0.01)
+
+    def _record_group_signals(self, monkeypatch, engine, pgid=4321, getpgid=None):
+        calls = []
+        monkeypatch.setattr(
+            engine.os, "getpgid", getpgid or (lambda pid: pgid)
+        )
+        monkeypatch.setattr(
+            engine.os, "killpg", lambda group, sig: calls.append((group, sig))
+        )
+        return calls
+
+    def test_the_posix_helper_signals_the_whole_group_then_escalates(
+        self, monkeypatch
+    ):
+        """SIGTERM to the pgid, then SIGKILL to the same pgid."""
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+        calls = self._record_group_signals(monkeypatch, engine)
+        # exit_after=1: the child ignores the graceful signal, as chrome does.
+        proc = _FakeProc(returncode=None, exit_after=1)
+
+        asyncio.run(engine._kill_posix_process_tree(proc, grace=0.01))
+
+        assert calls == [
+            (4321, signal.SIGTERM),
+            (4321, signal.SIGKILL),
+        ], "both signals must reach the process group"
+        assert proc.signals == [], (
+            "signalling only the direct child is the orphaning bug itself"
+        )
+
+    def test_a_child_that_exits_politely_is_not_killed(self, monkeypatch):
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+        calls = self._record_group_signals(monkeypatch, engine)
+        proc = _FakeProc(returncode=None, exit_after=0)
+
+        asyncio.run(engine._kill_posix_process_tree(proc, grace=0.5))
+
+        assert calls == [(4321, signal.SIGTERM)], (
+            "a render that honoured SIGTERM must not also be SIGKILLed"
+        )
+
+    def test_an_unreadable_group_falls_back_to_the_direct_child(self, monkeypatch):
+        """A pid with no group left still has to get the signal."""
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+
+        def no_such_group(pid):
+            raise ProcessLookupError(pid)
+
+        self._record_group_signals(monkeypatch, engine, getpgid=no_such_group)
+        proc = _FakeProc(returncode=None, exit_after=0)
+
+        asyncio.run(engine._kill_posix_process_tree(proc, grace=0.5))
+
+        assert proc.signals == [signal.SIGTERM]
+        assert not proc.killed
+
+    def test_a_sigkill_that_never_lands_is_backstopped_synchronously(
+        self, monkeypatch
+    ):
+        """A second cancellation mid-cleanup must still not leave chrome alive."""
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+
+        def no_such_group(pid):
+            raise ProcessLookupError(pid)
+
+        self._record_group_signals(monkeypatch, engine, getpgid=no_such_group)
+        proc = _FakeProc(returncode=None, exit_after=5)  # never exits
+
+        asyncio.run(engine._kill_process_tree(proc, grace=0.01))
+
+        assert proc.killed, "the finally in _kill_process_tree must force the child down"
+
+    def test_the_windows_helper_terminates_then_taskkills_the_whole_tree(
+        self, monkeypatch
+    ):
+        """proc.kill() alone leaves chrome and ffmpeg running on Windows."""
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+        spawns = []
+
+        async def fake_exec(*args, **kwargs):
+            spawns.append((list(args), kwargs))
+            return _FakeProc(returncode=0)
+
+        monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", fake_exec)
+        proc = _FakeProc(returncode=None, exit_after=1)  # ignores terminate()
+
+        asyncio.run(engine._kill_windows_process_tree(proc, grace=0.01))
+
+        assert proc.terminated is True, "a graceful terminate always goes first"
+        argv, _kwargs = spawns[0]
+        assert argv == ["taskkill", "/PID", str(proc.pid), "/T", "/F"], (
+            "/T walks the tree and /F is what chrome actually answers to"
+        )
+
+    def test_a_windows_child_that_terminates_needs_no_taskkill(self, monkeypatch):
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+        spawns = []
+
+        async def fake_exec(*args, **kwargs):
+            spawns.append((list(args), kwargs))
+            return _FakeProc(returncode=0)
+
+        monkeypatch.setattr(engine.asyncio, "create_subprocess_exec", fake_exec)
+        proc = _FakeProc(returncode=None, exit_after=0)
+
+        asyncio.run(engine._kill_windows_process_tree(proc, grace=0.5))
+
+        assert proc.terminated is True
+        assert spawns == [], "a polite exit must not reach the forcible path"
+
+    def test_the_dispatch_follows_the_platform(self, monkeypatch):
+        """Both branches stay reachable from a Linux run, via _is_windows."""
+        engine = render_engine_module()
+        chosen = []
+
+        async def fake_posix(proc, **kwargs):
+            chosen.append("posix")
+
+        async def fake_windows(proc, **kwargs):
+            chosen.append("windows")
+
+        monkeypatch.setattr(engine, "_kill_posix_process_tree", fake_posix)
+        monkeypatch.setattr(engine, "_kill_windows_process_tree", fake_windows)
+
+        monkeypatch.setattr(engine, "_is_windows", lambda: True)
+        asyncio.run(engine._kill_process_tree(_FakeProc(returncode=None)))
+        monkeypatch.setattr(engine, "_is_windows", lambda: False)
+        asyncio.run(engine._kill_process_tree(_FakeProc(returncode=None)))
+
+        assert chosen == ["windows", "posix"]
+
+    def test_a_process_that_already_exited_is_left_alone(self, monkeypatch):
+        """Reaping twice would raise, and signalling a dead pid is noise."""
+        engine = render_engine_module()
+        calls = self._record_group_signals(monkeypatch, engine)
+
+        asyncio.run(engine._kill_process_tree(_FakeProc(returncode=0)))
+
+        assert calls == []
+
+    def test_the_kill_never_raises_into_the_failure_path(self, monkeypatch):
+        """A kill that blows up must not replace the real render failure."""
+        engine = render_engine_module()
+        self._fast_grace(monkeypatch, engine)
+
+        def forbidden(pgid, sig):
+            raise PermissionError("nope")
+
+        self._record_group_signals(monkeypatch, engine)
+        monkeypatch.setattr(engine.os, "killpg", forbidden)
+        proc = _FakeProc(returncode=None, exit_after=1)
+
+        asyncio.run(engine._kill_process_tree(proc, grace=0.01))
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="asserts on /proc state, which is Linux-only",
+)
+class TestWatchdogAgainstARealProcess:
+    """One real subprocess group, so "no leak" is a measurement not a claim.
+
+    The rest of this file fakes the process object. This launches a stand-in
+    render - no npx, no HyperFrames, no minutes of waiting - that forks a
+    grandchild the way chrome-headless-shell forks from npx, then hangs. After
+    the watchdog fires, neither may still be running.
+    """
+
+    def _stand_in_render(self, tmp_path):
+        """An executable that records its own pid plus a hung grandchild's."""
+        script = tmp_path / "fake_render.py"
+        # A shebang pointing at the running interpreter keeps this portable
+        # across whatever python the suite was launched with.
+        script.write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys, time\n"
+            "marker = os.environ['FAKE_RENDER_MARKER']\n"
+            "grandchild = os.fork()\n"
+            "if grandchild == 0:\n"
+            "    time.sleep(600)\n"
+            "    os._exit(0)\n"
+            "with open(marker, 'w') as handle:\n"
+            "    handle.write('%d %d' % (os.getpid(), grandchild))\n"
+            "time.sleep(600)\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    @staticmethod
+    def _still_running(pid):
+        """True only for a live, non-zombie process."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            state = pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0]
+        except OSError:
+            return False
+        return state != "Z"
+
+    def test_a_hung_render_and_its_grandchild_are_both_gone(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setenv("DARK_STUDIO_RENDER_TIMEOUT", "0.5")
+        marker = tmp_path / "pids.txt"
+        monkeypatch.setenv("FAKE_RENDER_MARKER", str(marker))
+        monkeypatch.setattr(engine, "HYPERFRAMES_CLI", str(self._stand_in_render(tmp_path)))
+        output = tmp_path / "proj.mp4"
+
+        async def main():
+            with pytest.raises(RuntimeError, match="tempo limite"):
+                await engine.render_with_hyperframes(
+                    "proj", "<html></html>", output, tmp_path, 1080, 1920
+                )
+
+        started = time.time()
+        asyncio.run(main())
+        assert time.time() - started < 30, "the watchdog must fire without waiting it out"
+
+        assert marker.exists(), "the stand-in render never started"
+        parent, grandchild = (int(value) for value in marker.read_text().split())
+        assert not self._still_running(parent), "npx is still running after the timeout"
+        assert not self._still_running(grandchild), (
+            "chrome-headless-shell survived: only the direct child was killed"
+        )
+        assert not output.exists()
+
+
+class _FakeProc:
+    """A stand-in for :class:`asyncio.subprocess.Process`.
+
+    ``hang=True`` makes ``communicate()`` block forever, which is what a render
+    that outruns its budget looks like; it creates the output file first, because
+    a real renderer does. ``exit_after`` counts how many ``wait()`` calls the
+    process survives: 0 exits at once, 1 ignores the graceful signal (as chrome
+    does), 5 never exits within a test's patience.
+    """
+
+    def __init__(self, stdout=b"", stderr=b"", returncode=0, hang=False, exit_after=0):
+        self.pid = 4321
+        self.stdout_bytes = stdout
+        self.stderr_bytes = stderr
+        self.returncode = returncode
+        self.hang = hang
+        self._waits_left = exit_after
+        self.signals = []
+        self.terminated = False
+        self.killed = False
+        self.writes_output = None
+
+    async def communicate(self):
+        if self.writes_output is not None:
+            pathlib.Path(self.writes_output).write_bytes(b"partial-mp4")
+        if self.hang:
+            await asyncio.Event().wait()
+        return self.stdout_bytes, self.stderr_bytes
+
+    async def wait(self):
+        if self._waits_left > 0:
+            self._waits_left -= 1
+            await asyncio.sleep(3600)  # never returns inside a test
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        if self.returncode is None:
+            self.returncode = -9
+
+
