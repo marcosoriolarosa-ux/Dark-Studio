@@ -1,278 +1,348 @@
-# Arquitetura — Dark Studio
+# Arquitectura
 
-Como um tema chega a um MP4, o que cada modulo faz, porque o projecto foi escrito desta forma e onde esta mais fraco.
+Mapa de módulos com contagens de linhas reais, o pipeline etapa a etapa, o modelo de jobs e fila, o caminho do render, o grafo de módulos do frontend e o layout de dados. Para a instalação ver [INSTALL.md](INSTALL.md); para as rotas ver [API.md](API.md).
 
----
-
-## 1. O pipeline, ponta a ponta
-
-O caminho principal e o seguinte. Cada bloco corresponde a uma etapa real do codigo.
-
-    audio (ou tema, via /api/strategy)
-        |
-        v
-    [1] POST /api/transcribe          backend/app.py:84
-        faster-whisper -> segmentos {index, start, end, text}
-        |
-        v
-    [2] build_srt_from_segments       backend/services/pipeline.py:97
-        storage/uploads/<projeto>.srt
-        |
-        v
-    [3] POST /api/build-video         backend/app.py:108
-        |
-        +-- parse_srt_to_segments           pipeline.py:413   SRT -> segmentos
-        +-- extract_keywords_from_text      pipeline.py:176   termos globais de pesquisa
-        +-- build_storyboard_from_segments  pipeline.py:365   segmentos -> cenas
-        +-- search_media_for_scenes         pipeline.py:549   media POR CENA
-        |     +-- extract_visual_terms_with_ai   pipeline.py:483  (IA) ou
-        |     +-- extract_scene_keywords         pipeline.py:227  (heuristica)
-        |     +-- search_media_for_keywords      pipeline.py:447  -> Pexels / Pixabay
-        +-- build_edit_plan_from_segments  pipeline.py:393   plano de edicao
-        |
-        v
-    [4] render_video_hyperframes      backend/services/render_engine.py:584
-        +-- fit_storyboard_to_duration  pipeline.py:719   enquadra o storyboard no audio
-        +-- create_project_dir          render_engine.py:488  storage/outputs/.hf_<nome>/
-        +-- stage_project_assets        render_engine.py:262  copia media para assets/
-        |     +-- download_media_asset       pipeline.py:668
-        |     +-- looks_padded               asset_quality.py:70  (rejeita canvas branco)
-        +-- generate_composition_html   render_engine.py:357  composicao GSAP + CSS
-        +-- render_with_hyperframes     render_engine.py:544  npx hyperframes render
-        +-- cleanup_render_dirs         render_engine.py:525
-        |
-        v
-    storage/outputs/<projeto>.mp4
-        |
-        v
-    [5] GET /api/project/{nome}/video  -> FileResponse video/mp4
-
-Duas derivacoes partem do mesmo SRT:
-
-    [A] POST /api/shorts
-        detect_highlights                 shorts_pipeline.py:48   (IA, ou heuristica)
-        extract_words_with_timestamps     shorts_pipeline.py:189  karaoke por palavra
-        build_highlight_storyboard        shorts_pipeline.py:233  rebase=True: cenas em t=0
-        render_video_hyperframes(output_stem="<nome>_shorts", audio_path=None)
-        -> storage/outputs/<nome>_shorts.mp4   (sem audio: as palavras estao nas legendas)
-
-    [B] POST /api/build-viral
-        detect_beats                      viral_pipeline.py:40    librosa.beat.beat_track
-        build_beat_synced_storyboard      viral_pipeline.py:80    cortes presos ao ritmo
-        make_seamless_loop                viral_pipeline.py:144
-        generate_optimized_thumbnail      viral_pipeline.py:170   HTML em storage/thumbnails/
-        build_platform_metadata           viral_pipeline.py:217   hashtags, categoria, titulos
-        render_video_hyperframes(output_stem="<nome>_viral")
-        -> storage/outputs/<nome>_viral.mp4 + <nome>_viral_meta.json
-
-E um caminho lateral, sem video:
-
-    POST /api/strategy  ->  pipeline.call_free_model  ->  provider_registry  ->  OpenRouter (:free)
-                             com fallback local declarado em caso de falha
+Todas as contagens vêm de `wc -l` sobre a árvore actual.
 
 ---
 
-## 2. Mapa de modulos
+## 1. Mapa de módulos
 
-| Ficheiro | Responsabilidade, numa frase |
-|----------|------------------------------|
-| `backend/app.py` | A superficie HTTP: 14 endpoints, CORS, saneamento de nomes, montagem da WebUI em `/app`. |
-| `backend/services/pipeline.py` | O nucleo de dados: SRT, keywords, storyboard, plano de edicao, pesquisa de media e o re-export do gateway de IA. |
-| `backend/services/render_engine.py` | Gera a composicao HTML/CSS/GSAP e corre o HyperFrames via `npx`. |
-| `backend/services/asset_quality.py` | Mede com ffmpeg se uma imagem de stock esta embrulhada numa tela branca uniforme. |
-| `backend/services/shorts_pipeline.py` | Escolhe destaques, distribui tempos por palavra e monta o corte vertical. |
-| `backend/services/viral_pipeline.py` | Batidas, cortes ao ritmo, loop, thumbnail e metadados de plataforma. |
-| `backend/services/provider_registry.py` | Chama a IA: multi-fornecedor, multi-chave, retries, memoria de quota. |
-| `backend/services/auth_contract.py` | O unico lugar onde nasce um `AuthError` e onde vive o contrato `AUTH_*`. |
-| `frontend/index.html` | A WebUI (passo a passo + painel de definicoes). |
-| `frontend/auth-handler.js` | Traduz `AUTH_*` em accoes de UI: reenvio, redireccao para definicoes, toasts. |
-| `scripts/` | **Vazia nesta copia.** O brief menciona um `scripts/check_env.py` que aqui nao existe. |
-| `Dockerfile` | Tres estagios: `browser` (Chrome via Puppeteer), `builder` (venv), `runtime` (utilizador sem privilegios, uid 10001). |
-| `docker/entrypoint.sh` | Arranque em `sh` (dash, sem bashisms): `cd /app`, variaveis de locale, preflight, `uvicorn` em `0.0.0.0:$DARK_STUDIO_PORT` e reencaminhamento de `SIGTERM`. |
-| `docker-compose.yml` | Volume nomeado para `storage/`, `init: true`, `shm_size: 2gb`, healthcheck, chaves de API todas com `${VAR:-}`. |
-| `tests/` | 259 testes em 9 ficheiros, sem rede por omissao. |
+### Backend — 8433 linhas
 
-### Onde cada responsabilidade NAO esta (nesta copia)
+| Módulo | Linhas | Responsabilidade |
+| --- | --- | --- |
+| `backend/app.py` | 1048 | 27 rotas FastAPI, CORS, montagem de `/app`, modelos Pydantic, saneamento de nomes |
+| `backend/services/render_engine.py` | 1172 | Composição HTML, HyperFrames via `npx`, mistura de música com `ffmpeg`, directório de projecto |
+| `backend/services/provider_registry.py` | 1026 | Registo de fornecedores de IA, chaves múltiplas, memória de quota, retentativas |
+| `backend/services/music.py` | 798 | Biblioteca musical: 6 faixas sintetizadas, uploads, manifesto, loop e parâmetros de mistura |
+| `backend/services/pipeline.py` | 739 | Transcrição, SRT, palavras-chave, storyboard, pesquisa de media, cache |
+| `backend/services/generator.py` | 712 | Orquestrador de um clique, registo de jobs, fila, marcos de progresso |
+| `backend/services/style.py` | 626 | 8 temas, `SubtitleStyle`, validação e vocabulários fechados |
+| `backend/services/tts.py` | 582 | 53 vozes `edge-tts`, OpenAI e Azure; divisão de texto longo; estado de disponibilidade |
+| `backend/services/script_gen.py` | 575 | Guião em 5 idiomas, recurso local, extracção de termos visuais |
+| `backend/services/shorts_pipeline.py` | 491 | Detecção de destaques, karaoke por palavra, cut de formato curto |
+| `backend/services/viral_pipeline.py` | 363 | Beat-sync, loop contínuo, thumbnail, metadados de plataforma |
+| `backend/services/asset_quality.py` | 157 | Rejeição de imagens com moldura branca, via `ffmpeg signalstats` |
+| `backend/services/auth_contract.py` | 143 | Seis códigos `AUTH_*`, `AuthError`, mapeamento de estados HTTP |
+| `backend/services/__init__.py` | 1 | — |
 
-O brief do projecto menciona TTS, geracao de guiao por IA, temas de legendas e musica de fundo. **Nenhum desses modulos existe nesta copia do repositorio.** O caminho Docker existe; o que falta sao os modulos de media que o brief promete:
+### Frontend — 5358 linhas, das quais 3900 de JavaScript
 
-| Modulo esperado | Estado | Consequencia |
-|-----------------|--------|--------------|
-| `backend/services/tts.py` | ausente | Nao ha `/api/tts`, `/api/voices`, `/api/languages` nem `/api/tts/status`. A narracao tem de vir de um ficheiro de audio carregado pelo utilizador. |
-| `backend/services/script_gen.py` | ausente | Nao ha `/api/script`. O texto de origem e sempre um audio transcrito. |
-| `backend/services/style.py` | ausente | Nao ha `/api/presets` nem parametros de estilo. A tipografia das legendas esta fixa em `render_engine._TRANSITIONS_CSS`, com quatro variantes (bottom, center, hook, karaoke) em vez de oito temas. |
-| `backend/services/music.py` | ausente | Nao ha `/api/music/*`. A `render_video_hyperframes` atual nao tem `music_track`, `music_volume` nem `duck_voice`, e nao ha qualquer mixagem de musica. |
-| `scripts/check_env.py` | ausente | Nao ha verificador de ambiente para correr antes do arranque. Ver [INSTALL.md](INSTALL.md). |
-| `frontend/styles.css`, `frontend/js/` | ausentes, **mas nao sao necessarios** | A WebUI e hoje um unico `index.html` com o CSS e o JS todos inline. Nao ha `styles.css`, nem `js/main.js`, nem `js/views/`. |
-| `storage/music/` | criado so no container | O `Dockerfile:293` e o `entrypoint.sh:55` criam `storage/music/`, mas nenhum modulo deste checkout escreve la: sobra do modulo de musica que nao existe. |
+| Ficheiro | Linhas | Papel |
+| --- | --- | --- |
+| `frontend/styles.css` | 1394 | Todo o aspecto visual; sem dependências externas |
+| `frontend/js/ui.js` | 363 | Fabrico de DOM: `el`, `card`, `banner`, `toast`, `badge`, campos, `skeletonStack` |
+| `frontend/js/generator.js` | 288 | Painel de progresso do fluxo de um clique: etapas, barra, *poll* |
+| `frontend/js/views/create.js` | 297 | Vista «Criar» — onde se escreve o tema |
+| `frontend/js/views/generate.js` | 278 | Vista «Gerar» — briefing e submeter o `POST /api/generate` |
+| `frontend/js/views/shorts.js` | 276 | Vista «Formatos curtos» |
+| `frontend/js/composition.js` | 263 | Formulário de composição, partilhado por «Criar» e «Estúdio» |
+| `frontend/js/api.js` | 258 | A única costura de rede: `apiFetch`, `apiJson` e um *wrapper* por rota |
+| `frontend/js/views/settings.js` | 241 | Vista «Definições» — chaves e sondas de diagnóstico |
+| `frontend/js/views/studio.js` | 213 | Vista «Estúdio» — composição e render de um projecto |
+| `frontend/js/views/projects.js` | 197 | Vista «Projetos» — inventário e histórico de jobs de um clique |
+| `frontend/js/main.js` | 198 | Router por *hash*, ciclo de vida das vistas, erro global |
+| `frontend/js/pickers/music.js` | 185 | Selector de ambiente e faixa |
+| `frontend/js/pickers/voices.js` | 167 | Selector de voz, agrupado por locale |
+| `frontend/js/pickers/subtitle.js` | 155 | Editor de estilo de legenda: cor, tamanho, posição, modo |
+| `frontend/js/state.js` | 120 | Store observável mínimo; `localStorage` para preferências |
+| `frontend/js/catalog.js` | 102 | Cache preguiçosa dos catálogos partilhados entre vistas |
+| `frontend/js/pickers/presets.js` | 56 | Selector de tema |
+| `frontend/js/projects.js` | 53 | Agrupa ficheiros de `/api/projects` em linhas de projecto |
+| `frontend/index.html` | 64 | Casca: barra lateral, *crumb*, contentor `#ds-view` |
+| `frontend/auth-handler.js` | 299 | Contrato `AUTH_*` no navegador. **Não modificado**, carregado como script clássico |
 
-`librosa` e `numpy` sao importados no topo de `viral_pipeline.py`, e `backend/app.py` importa esse modulo no topo: sao dependencias **obrigatorias de arranque** apesar de nao constarem do `requirements.txt`.
+Os 18 módulos de `frontend/js/` (excluindo `auth-handler.js`) somam 3601 linhas.
 
----
+### Restante da árvore
 
-## 3. Dados em disco
-
-    storage/
-      uploads/         <projeto>.mp3          audio transcrito
-                       <projeto>.srt          legendas geradas (a fonte da verdade do video)
-      outputs/         <projeto>.mp4          render principal
-                       <projeto>_shorts.mp4   corte vertical
-                       <projeto>_viral.mp4    corte viral
-                       <projeto>.json         resumo do render
-                       <projeto>_shorts.json  resumo do short
-                       <projeto>_viral_meta.json  batidas + metadados + storyboard
-                       .hf_<projeto>/         directorio de trabalho do HyperFrames
-                            index.html        a composicao gerada
-                            hyperframes.json  manifesto do HyperFrames
-                            package.json      scripts `render` e `check`
-                            assets/           media e audio copiados para aqui
-      media/           <projeto>/scene_<i>_<hash>.jpg   cache de media descarregada
-      thumbnails/      <projeto>_thumb.html            documento do thumbnail
-
-Um "projeto" nao e um registo: e um prefixo de nome de ficheiro. `GET /api/projects` devolve os ficheiros, nao os projetos.
-
-O cache de media e chaveado por **hash do URL** alem do indice da cena (`pipeline.py:682`). Keying so pelo indice fazia com que um segundo candidato para a mesma cena devolvesse o ficheiro do primeiro, e a substituicao por qualidade nunca progredia.
-
----
-
-## 4. Decisoes de desenho, e porque
-
-### HyperFrames em vez de FFmpeg direto
-
-`render_engine.py` nao constroi um `filter_complex` de video. Gera um documento HTML com CSS e GSAP (`generate_composition_html`, linha 357) e deixa o HyperFrames — que corre Chrome headless via `npx` — produzir os frames.
-
-O motivo esta no proprio codigo: as transicoes, o Ken Burns, o desfoque de saida e o overlay de grao sao todos *aninacoes de timeline*. Em FFmpeg seriam `zoompan` + `xfade` + `gblur` com filtros de sobreposicao, afinados a mao por cena. Em GSAP sao `tl.fromTo(...)` com tempos absolutos, e o resultado e seek-safe e reproduzivel frame a frame. O `ffmpeg`/`ffprobe` continuam a ser o apoio para **analise** (duracao, deteccao de padding), que e barato e exato.
-
-Consequencia pratica: o render depende de Node, npx, Chrome e de um download de ~170 MB no primeiro arranque. E o unico gargalo de distribuicao do projecto.
-
-### Pesquisa de media por cena, e nao global
-
-`search_media_for_scenes` (`pipeline.py:549`) pesquisa cada cena com os termos **dessa** cena; `search_media_for_keywords` continua a existir, mas so como pool de recurso quando a pesquisa global devolve alguma coisa e uma cena nao tem nada seu.
-
-O comentario no codigo e explicito: uma lista global de keywords da a todas as cenas a mesma imagem. `extract_visual_terms_with_ai` pede ao modelo dois termos **em ingles** por cena, porque os indices de stock indexam muito melhor ingles do que portugues — "banknotes", nao "papeis coloridos". Sem chave ou sem quota, cai para `extract_scene_keywords`, que extrai da legenda da propria cena. O resultado diz qual dos dois foi usado, em `term_source`.
-
-`build_storyboard_from_segments` alterna `fade`/`slide_left` e `cinematic`/`glow` para que duas cenas consecutivas nunca pareçam iguais.
-
-### Sobrepor cenas para as transicoes
-
-`normalize_scene_timings` (`pipeline.py:319`) faz cada cena comecar `SCENE_OVERLAP = 0.7` segundos antes do seu tempo de origem. O objectivo e explicito: dar a um wipe algo para revelar por cima. Os **fins** ficam na timeline de origem, o que mantem a naracao sincronizada e faz as pausas entre segmentos serem cobertas visualmente pela cena seguinte em vez de silencio morto.
-
-Duas protecoes evitam o caos: um segmento mais curto que `MIN_SCENE_DURATION = 0.8` e esticado ate esse minimo, e duas cenas degeneradas no mesmo instante sao separadas por 0.2 s em vez de empilhadas. As legendas nunca se sobrepoem — quem as recorta e `generate_composition_html`, que sabe onde comeca a vizinha.
-
-### Somente modelos `:free`
-
-E uma invariante em tres camadas:
-
-1. `POST /api/settings` recusa com `400` um `openrouter_model` que nao termine em `:free`.
-2. `provider_registry._call_openrouter_compat` volta a verificar antes de cada chamada.
-3. Nao existe parametro nenhum, em nenhum endpoint, que permita pedir um modelo pago.
-
-A raza e o objectivo do projecto: uma aplicacao que funciona sem cartao e sem custo por execucao. `provider_registry` suporta varios fornecedores (OpenRouter, NVIDIA, OpenCode, Gemini, OpenAI) e varios metodos de chave (`<PREFIX>_API_KEY`, `<PREFIX>_API_KEY_1..5`, `<PREFIX>_API_KEYS` separado por virgulas), mas so o OpenRouter tem `free_model_filter`, logo e o unico que a politica de gratuito cobre por completo. Uma chave desativada ao fim de cinco erros (`provider_registry._update_key_state`) faz o registo passar a seguinte automaticamente.
-
-### Assets copiados para dentro do directorio da composicao
-
-`stage_project_assets` (`render_engine.py:262`) copia cada ficheiro referenciado para `storage/outputs/.hf_<projeto>/assets/` e a composicao passa a referenciar `assets/<ficheiro>` em vez de um caminho absoluto para `storage/media`.
-
-A raza esta no docstring: o HyperFrames serve a composicao a partir do seu proprio directorio de projecto e **recusa recursos locais fora dele**. Um caminho absoluto para `storage/media` simplesmente nao carrega. A copia resolve tambem a cache entre renders — o directorio e apagado e recriado a cada render, logo nunca sobra um frame antigo.
-
-### Rejeitar imagens com tela branca
-
-`looks_padded` (`asset_quality.py:70`) mede com ffmpeg. Alguns fornecedores devolvem uma JPEG 1880x1246 que e ~45% branco uniforme; `object-fit: cover` reproduz essa tela com fidelity e o video fica com um bloco branco a dar a sensacao de estar partido.
-
-A deteccao faz duas sondas por cada borda — uma rasa (12% do lado menor) e outra funda (35%). A raza e a profundidade que decidem: uma faixa fina e uniforme so prova que a borda e plana; se a regiao aos 35% ainda for plana e clara, o asset esta realmente embrulhado. Um frame uniformemente claro no geral e uma foto de high-key, nao padding. O veredicto e cacheado por hash do conteudo.
-
-A imagem rejeitada nao e descartada: `stage_project_assets` passa ao candidato seguinte do pool, e o payload traz `rejected_assets` com o URL recusado e o motivo.
-
-### Grao e progresso deterministas
-
-`_grain_overlay` e `_progress_bar` animam por **passos absolutos em tempos absolutos**, nunca com `infinite`. O docstring explica: uma animacao CSS `infinite` avanca com o tempo de parede e faria cada render sair ligeiramente diferente; passos limitados e seek-safe dao sempre o mesmo frame no mesmo instante.
+| Ficheiro | Linhas |
+| --- | --- |
+| `tests/*.py` (16 ficheiros) | 6653 |
+| `scripts/check_env.py` | 441 |
+| `Dockerfile` | 353 |
+| `start.bat` | 165 |
+| `docker-compose.yml` | 133 |
+| `docker/entrypoint.sh` | 129 |
+| `docker-compose.gpu.yml` | 83 |
+| `start.sh` | 96 |
+| `requirements.txt` | 56 |
+| `.env.example` | 50 |
+| `pytest.ini` | 6 |
+| `Abrir Dark Video Studio.bat` | 10 |
 
 ---
 
-## 5. Desenho geral
+## 2. A costura
 
-    +-------------------------------------------------------------+
-    |  Navegador   http://127.0.0.1:8013/app/                     |
-    |  frontend/index.html + auth-handler.js                      |
-    +----------------------------+--------------------------------+
-                                 | fetch()  (CORS: apenas :8013)
-    +----------------------------v--------------------------------+
-    |  backend/app.py      FastAPI + uvicorn, bind 127.0.0.1     |
-    |    sanitize_name()  ->  storage/uploads/<nome>.{srt,mp3}    |
-    +--+--------------+--------------+-------------+--------------+
-       |              |              |             |
-       v              v              v             v
-   pipeline      render_engine   shorts_        viral_
-   .py           .py             pipeline.py    pipeline.py
-       |              |              |             |
-       |              |              |             +--> librosa (beats)
-       |              |              +--> call_free_model (destaques)
-       |              |                  |
-       |              |                  v
-       |              |             provider_registry.py --> OpenRouter :free
-       |              |                  |
-       |              |                  +-- sem chave/quota --> fallback local
-       |              v
-       |          npx --yes hyperframes@0.8.92 render
-       |              |
-       |              +--> Chrome headless  (frames)
-       |              +--> ffmpeg / ffprobe  (analise)
-       |
-       +--> Pexels / Pixabay / OpenRouter
-       +--> asset_quality.py --> ffmpeg signalstats
+O desenho tem um só objectivo estrutural: **`backend.app` é a única costura que os testes tocam.**
 
-Fluxo de uma requisicao de video, em ordem:
+Os serviços são importados como **nomes**, não como módulos (`backend/app.py:20`), e o comentário no topo do ficheiro explica porquê: assim `mock.patch.object(app_module, "generate_script")` é a única indirecção entre a API e a camada de serviços.
 
-    HTTP POST /api/build-video
-      -> sanitize_name, existe .srt?          (400 se nao)
-      -> parse_srt_to_segments
-      -> build_storyboard_from_segments       (+ normalize_scene_timings)
-      -> search_media_for_scenes              (IA ou heuristica; cache por keyword)
-      -> search_media_for_keywords            (pool de recurso)
-      -> build_edit_plan_from_segments
-      -> render_video_hyperframes
-           -> create_project_dir              (apaga e recria .hf_<nome>)
-           -> stage_project_assets            (download + cache + rejeicao de padding)
-           -> generate_composition_html       (HTML / CSS / GSAP)
-           -> render_with_hyperframes         (subprocess npx)
-           -> cleanup_render_dirs             (remove os .hf_* antigos)
-           -> escreve outputs/<nome>.json
-      -> JSON com storyboard, edit_plan, media, render
+`generator` é a excepção deliberada: é importado como **módulo** (`backend/app.py:76`), porque o registo de jobs é estado ao nível do módulo e toda a leitura e escrita tem de passar pelo mesmo objecto.
+
+`viral_pipeline` é a segunda excepção: importado **preguiçosamente**, dentro do corpo de `build_viral` (`backend/app.py:745`). Precisa de `librosa`, e um import no topo do módulo fazia o servidor inteiro não arrancar sem ele. Sem o `librosa`, a rota devolve `503` com uma mensagem que diz como o instalar (`backend/app.py:746`).
+
+O frontend segue a mesma ideia. `frontend/js/api.js` é a única costura de rede, com `API_BASE` igual à string vazia (`frontend/js/api.js:13`), porque a página é servida na mesma origem que a API. Não há CORS, não há *preflight*, não há host fixo no código.
 
 ---
 
-## 6. Pontos fracos conhecidos
+## 3. O pipeline, etapa a etapa
 
-**O `requirements.txt` esta incompleto.** `viral_pipeline.py` importa `librosa` e `numpy` no topo, e `backend/app.py:33` importa esse modulo no topo. Nenhum dos dois esta no `requirements.txt`. Uma instalacao limpa com `pip install -r requirements.txt` falha no arranque com `ModuleNotFoundError: No module named 'librosa'`. O `numpy` acaba por chegar por via do `faster-whisper`, mas o `librosa` nao chega por lado nenhum.
+### 3.1 O caminho de um clique
 
-**O build Docker falha tal como o repositorio esta.** `Dockerfile:333` corre, no fim do build, `python -c "import fastapi, uvicorn, numpy, soundfile, librosa, edge_tts"`, e nenhum desses quatro ultimos pacotes esta no `requirements.txt`. O comentario no codigo explica a intencao — *"um pacote obrigatorio em falta no requirements.txt tem de fazer o BUILD falhar"* — e e exactamente o que acontece, no ultimo passo, depois de todo o trabalho caro. Some-se a isto o `Dockerfile:283`, que copia uma pasta `scripts/` sem um unico ficheiro versionado. Corrigir o `requirements.txt` resolve os dois de uma vez.
+`generator.run_generation` (`generator.py:566`) conduz quatro etapas. O progresso é escrito por `_stage` (`generator.py:547`), que só mexe em `stage`, `progress` e `message` — **nunca** em `status`.
 
-**Nao ha verificacao de ambiente no arranque nativo.** O `scripts/check_env.py` a que o `entrypoint.sh:71` chama nao esta nesta copia (a pasta `scripts/` esta vazia, e `git ls-files scripts` nao devolve nada). O entrypoint trata o caso sem quebrar — avisa e verifica so os quatro binarios — mas em modo nativo nao ha preflight nenhum: um ambiente incompleto descobre-se quando o render falha. Note-se a assimetria: o caminho nativo, que e o caminho de referencia do projecto, e o unico sem preflight.
+| # | Etapa | Progresso | Chamadas |
+| --- | --- | --- | --- |
+| 1 | `script` | `0.05` | `script_gen.generate_script` |
+| 2 | `voice` | `0.20` | `tts.synthesize_speech_long`, `pipeline.transcribe_audio_file`, escrita do SRT |
+| 3 | `media` | `0.40` | `pipeline.build_storyboard_from_segments`, `pipeline.search_media_for_scenes`, `pipeline.search_media_for_keywords` |
+| 4 | `render` | `0.60` | `style.resolve_preset_and_style`, `music.pick_track`, `render_engine.render_video_hyperframes` |
+| 5 | `done` | `1.00` | resultado anexado ao job; `status` passa a `completed` |
 
-**`DARK_STUDIO_ALLOWED_ORIGINS` nao e lida por ninguem.** O `docker-compose.yml:48` passa-a ao container e o comentario ao lado descreve com detalhe como a usar para acesso remoto. O `backend/app.py:46` tem as origens CORS escritas no codigo e nao le nenhuma variavel de ambiente. A documentacao do compose descreve um mecanismo que nao existe.
+Antes da etapa 1, `_project_slug` (`generator.py:82`) deriva o nome do projecto a partir de `project_prefix`, ou do tema. `slugify_topic` (`generator.py:98`) normaliza com NFKD, decompõe os acentos e reduz tudo o que não for alfanumérico a um hífen. O resultado nunca tem separadores de caminho nem `..`.
 
-**`AZURE_SPEECH_KEY` e `AZURE_SPEECH_REGION` tambem nao sao lidas**, e `edge_tts` aparece na sanidade de build do `Dockerfile` sem que exista modulo de TTS. Sao tres rastos do mesmo projecto — o de TTS — que nao chegou a esta copia.
+**A degradação nunca é uma excepção.** Qualquer falha de etapa passa por `_fail` (`generator.py:555`), que escreve `status: "failed"`, uma mensagem em português e `progress: 0.0`, e devolve `{}`. O `_run_job` tem uma segunda rede (`generator.py:494`) para o caso de a excepção escapar do `run_generation`.
 
-**`librosa` e um custo de arranque.** O primeiro `import librosa` compila e cacheia o numba e demora varios segundos.
+Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)` (`generator.py:506`), para que o código sobreviva à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico.
 
-**A transcricao degrada em silencio.** `transcribe_audio_file` engole qualquer excecao do `faster-whisper` e devolve cinco frases fixas em portugues, com 3 segundos cada. Um SRT errado nao da erro em lado nenhum: `/api/transcribe` responde `200` e `/api/build-video` renderiza um video confiavelmente errado. E o defeito mais facil de nao detectar de todo o projecto.
+O `render_engine` não levanta quando o HyperFrames falha: devolve `status: "error"`. Por isso o pipeline trata esse caso como falha de etapa (`generator.py:677`), para o job não acabar `completed` com um resultado partido.
 
-**A porta esta fixa em 8013 no arranque nativo.** Nem `start.bat` nem `start.sh` leem `DARK_STUDIO_PORT` nem procuram uma porta livre acima dela. Se a 8013 estiver ocupada, o arranque falha. Dentro do container a variavel funciona, porque o `entrypoint.sh:40` a le — mas o `ports: "8013:8013"` do compose esta escrito a mao, entao as duas tem de mudar em conjunto.
+### 3.2 O caminho manual
 
-**A WebUI e um unico ficheiro.** `frontend/index.html` tem 112 linhas com o CSS e o JavaScript todos inline, minificados, e carrega apenas `auth-handler.js`. Nao ha build step nem separacao de componentes. Para uma aplicacao destined a crescer, e a divida tecnica mais visivel de toda a base de codigo — e a raza de o `auth-handler.js` ser, apesar do nome, a unica unidade de logica de cliente extraida.
+O caminho manual é o mesmo, com o utilizador a controlar os passos e a WebUI a fazer o *round-trip* entre eles:
 
-**A origem CORS esta fixa no codigo.** `backend/app.py:46` permite `http://127.0.0.1:8013` e `http://localhost:8013`, sem regex e sem ler variavel de ambiente. O atalho `Abrir Dark Video Studio.bat` serve a interface na porta 8080 — uma origem que o backend bloqueia — e nao mostra janela do servidor.
+```
+POST /api/script       ->  guião, guardado em storage/uploads/<nome>.script.json
+POST /api/tts          ->  MP3 + transcrição + storage/uploads/<nome>.srt
+POST /api/build-video  ->  pesquisa de media + composição + HyperFrames + MP4
+```
 
-**`Abrir Dark Video Studio.bat` usa `Get-NetTCPConnection`, que precisa do modulo NetTCPIP.** Em um Windows onde esse modulo nao esteja carregado, o comando falha e o script sai sem arrancar nada, sem mensagem de erro.
+O truque que liga os dois: quando `POST /api/script` recebe `project_name`, guarda o guião em disco (`backend/app.py:177`). Depois, `POST /api/tts` com `text` vazio lê-o de volta (`backend/app.py:188`) e narra sem o cliente ter de reenviar o texto todo. Se não houver `full_text`, reconstrói a partir do gancho mais as secções.
 
-**A memoria de quota vive no processo.** `_OPENROUTER_QUOTA` (`provider_registry.py:669`) e um dicionario em memoria. Reiniciar limpa o estado, e `GET /api/providers` mostra `null` ate haver uma chamada real ao OpenRouter.
+`POST /api/build-video` exige que o `.srt` exista (`backend/app.py:604`) — é o ficheiro que o `pipeline` consegue sempre interpretar, mesmo quando a transcrição degradou.
 
-**O cache de media e por processo.** `_MEDIA_CACHE` (`pipeline.py:444`) vive em memoria e nunca e invalidado. Numa sessao longa, uma fotografia que o fornecedor deixou de servir continua a ser servida a partir do cache.
+### 3.3 A degradação silenciosa da transcrição
 
-**Os testes `live` correm por omissao.** `pytest.ini` declara os marcadores mas nao os desmarca. Um `pytest` sem argumentos inclui `tests/test_live_providers.py`; cada teste salta se a chave correspondente nao existir, mas com chaves configuradas isso e uma chamada real a uma API por teste, a gastar a quota diaria do OpenRouter.
+O ponto mais importante deste projecto, e o mais fácil de não ver.
 
-**`tests/test_e2e.py` importa `requests`, que nao esta no `requirements.txt`.** Alem disso, qualquer teste que importe `backend.app` precisa de `librosa` instalado.
+```python
+def transcribe_audio_file(file_path: Path) -> ...:
+    try:
+        from faster_whisper import WhisperModel
+        ...
+        if results:
+            return results
+    except Exception:
+        pass
+    phrases = ["A rotina moderna nos consome em excesso.", ...]
+    return [{"index": i+1, "start": i*3.0, "end": (i+1)*3.0, "text": p}
+            for i, p in enumerate(phrases)]
+```
 
-**O `.venv` versionado e um venv do Windows.** A pasta `.venv/` na raiz tem `Lib/`, `Scripts/` e `Include/` — e um virtualenv Windows, inutilizavel em Linux ou macOS.
+`pipeline.py:64`. Duas condições diferentes caem no mesmo caminho: o pacote em falta (`ImportError`) **e** o modelo a devolver zero segmentos. As duas resultam em cinco frases fixas em português, cada uma de 3 segundos, com um `200` e sem campo nenhum de aviso.
 
-**A WebUI chama a API com caminhos relativos.** `frontend/index.html:32` define `const apiBase = ''`, com o comentario *"Served from the same origin as the API, so a relative base works on any port and no CORS preflight is involved"*. E a decisao certa: dispensa a configuracao de `apiBase` e dispensa preflight. A contrapartida e que a interface so funciona servida pelo proprio backend, em `/app/`. O atalho `Abrir Dark Video Studio.bat`, que a serve com `python -m http.server 8080`, quebra todas as chamadas — e e o unico caminho que o projecto oferece para ter a interface sem a janela do servidor visivel.
+Não é teórico. `/api/tts` chama `transcribe_audio_file` logo a seguir a sintetizar a narração (`backend/app.py:436`) e escreve o SRT com o que recebeu; `/api/build-video` consome esse SRT a seguir. Verificado com um MP3 de 3 bytes: `200`, com o SRT de recurso. Um `.srt` inventado é exactamente o que vai para o vídeo.
+
+### 3.4 Pesquisa de media por cena
+
+`search_media_for_scenes` (`pipeline.py:549`) prefere termos escritos pelo modelo (`pipeline.py:483`) e, sem modelo, extrai-os da legenda da própria cena (`pipeline.py:227`). É a diferença entre um vídeo em que cada imagem corresponde ao que está a ser dito e um vídeo em que todas as cenas reciclam a mesma lista global.
+
+Em `POST /api/build-video` a escolha é explícita (`backend/app.py:657`): o pool por cena ganha, e o pool global só é usado quando não há nenhum.
+
+`asset_quality.looks_padded` (`asset_quality.py:70`) rejeita a seguir as imagens com moldura branca. Mede a luminância média e o mínimo e máximo a duas profundidades de cada borda: uma faixa quase branca e uniforme numa imagem que não é é a assinatura de um *padding* de stock. O asset rejeitado passa a candidato seguinte, e a lista dos rejeitados entra em `render.rejected_assets`.
+
+---
+
+## 4. Jobs e fila
+
+### 4.1 O registo
+
+`generator` mantém o estado ao nível do módulo (`generator.py:284`):
+
+```python
+_jobs: Dict[str, Job] = {}
+_lock = asyncio.Lock()
+_slot_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_running_ids: set = set()
+_next_seq: int = 0
+```
+
+`MAX_CONCURRENT_JOBS = 2` (`generator.py:45`): cinco renders ao mesmo tempo esgotariam a memória de uma máquina normal. O semáforo é criado ao nível do módulo e reutilizado entre event loops, porque o `pytest-asyncio` cria um por teste.
+
+O registo é limitado por dois lados, em `_prune_locked` (`generator.py:310`): jobs terminados com mais de uma hora são removidos, e há um tecto duro de `MAX_JOB_HISTORY = 200`. Jobs em fila ou a correr **nunca** são podados, ou o servidor perderia trabalho.
+
+As leituras públicas devolvem cópias profundas. `get_job` (`generator.py:346`) e `list_jobs` (`generator.py:352`) usam `_copy_job` (`generator.py:362`), e `Job.to_dict` (`generator.py:261`) faz um round-trip por JSON dos campos mutáveis. Um cliente não consegue mexer no registo pelo que recebeu.
+
+A ordenação usa `updated_at` **e** `_seq` (`generator.py:356`). Os timestamps ISO-8601 só têm granularidade de segundo, por isso dois jobs submetidos no mesmo segundo empatariam; o contador monotónico de inserção é o desempate estável.
+
+### 4.2 Submeter
+
+`submit_job` (`generator.py:405`) valida, regista um job `queued` e devolve **imediatamente**. A validação é `GenerationRequest.validate` (`generator.py:153`), que devolve uma cópia com as omissões preenchidas e todos os campos dentro dos limites, levantando `ValueError` com mensagem em português no primeiro problema.
+
+Depois, se houver um event loop a correr, `loop.create_task` agenda o worker. Se não houver — um teste, um script síncrono — o job fica em fila e é o chamador que tem de conduzir `_run_job`. É por isso que `POST /api/generate` é `async def`: a rota tem de correr no loop, senão o `create_task` não tem onde aterrar e o job ficava para sempre em fila.
+
+### 4.3 O corpo do pedido é filtrado
+
+`backend/app.py:789` lê o conjunto de campos permitidos do próprio dataclass em tempo de importação:
+
+```python
+GENERATION_PARAM_FIELDS: frozenset[str] = frozenset(
+    field.name for field in dataclass_fields(generator.GenerationRequest)
+)
+```
+
+`_generation_params` (`backend/app.py:794`) deixa passar só essas chaves. O motivo está no docstring: `submit_job` faz `GenerationRequest(**params)`, portanto uma chave estranha de um cliente mais antigo ou escrito à mão voltaria como `TypeError`. Filtrar aqui é a diferença entre um `202` e um `400` para um cliente que não controlamos. Verificado: `{"topic": "...", "bogus_key": "x", "mood": "dark"}` devolve `202`.
+
+### 4.4 O estado nunca é `running`
+
+Este é o detalhe que mais surpreende quem lê o código à primeira.
+
+`Job.status` só toma os valores `queued`, `completed`, `failed` e `cancelled`. **`_stage` não toca em `status`**, e `_run_job` também não: só o `_fail` e o fim de `run_generation` o escrevem. O conjunto `_running_ids` existe (`generator.py:292`), mas `cancel_job` não o consulta.
+
+Consequência, verificada em execução: a meio de um job, o snapshot diz `status: "queued"` com `stage: "voice"` e `progress: 0.2`. Como `cancel_job` (`generator.py:381`) só recusa quando o estado não é `queued`, ele **aceita cancelar um job que já está a renderizar** e devolve `cancelled` verdadeiro. O trabalho não é interrompido — o render continua até ao fim — e o estado final é uma corrida entre a conclusão e o cancelamento. Se a etapa lançar depois do cancelamento, o bloco *worker* escreve `failed` (`generator.py:512`), o que pode substituir um `cancelled` por um `failed`.
+
+O mesmo estado afecta o painel: `frontend/js/generator.js:39` trata `queued` como «inactivo» antes de olhar para a etapa, por isso as etapas mostram-se inactivas durante o trabalho.
+
+Isto está listado como limitação em [README.md](../README.md#limitações-conhecidas), não escondido aqui.
+
+### 4.5 Poda e histórico
+
+`GET /api/jobs` devolve **um array simples**, não um envelope. É a única rota do servidor com essa forma, e o próprio frontend tem de se guardingar disso (`frontend/js/api.js:183` documenta-o explicitamente, e a vista de projectos verifica `Array.isArray` antes de iterar). Um cliente que leia `resposta.jobs` obtém `undefined` em silêncio.
+
+---
+
+## 5. O caminho do render
+
+`render_engine.render_video_hyperframes` (`render_engine.py:995`) é o ponto de entrada. É `async` e devolve sempre um *dict*: `status: "rendered"` ou `status: "error"` com a mensagem. **Não levanta** quando o render falha — o que obriga o pipeline a verificar `status` explicitamente.
+
+### 5.1 As sete etapas
+
+1. **Resolver o storyboard.** Se não vier nenhum, `parse_srt_to_segments` e `build_storyboard_from_segments` tratam disso (`render_engine.py:1027`). Se mesmo assim ficar vazio, há uma cena de recurso, para que o HyperFrames tenha alguma coisa para renderizar.
+2. **Ajustar à duração do áudio.** Com `audio_duration` conhecida, `pipeline.fit_storyboard_to_duration` (`pipeline.py:719`) redistribui as cenas para o áudio, e não o contrário.
+3. **Preparar o directório.** `create_project_dir` (`render_engine.py:640`) cria `storage/outputs/.hf_<nome>/`, **apaga-o primeiro** para que assets de uma execução anterior nunca vazeiem, e escreve `hyperframes.json` e `package.json` com o *script* de render já fixado à versão.
+4. **Copiar os assets.** `stage_project_assets` (`render_engine.py:345`) copia media e áudio para `<project_dir>/assets/` e devolve referências relativas. É obrigatório: o HyperFrames recusa recursos locais fora do directório do projecto. Testa cada imagem com `looks_padded` (`render_engine.py:415`) e recolhe as rejeitadas.
+5. **Gerar o HTML.** `generate_composition_html` (`render_engine.py:458`) emite a composição com `build_subtitle_css` (`render_engine.py:168`) a aplicar o `SubtitleStyle` resolvido por `style.resolve_preset_and_style` (`style.py:611`). As animações por cena estão em `_scene_media_animations` (`render_engine.py:266`).
+6. **Renderizar.** `render_with_hyperframes` (`render_engine.py:696`) corre `npx --yes hyperframes@0.8.92 render` com uma lista de argumentos — nunca uma *shell string*. Se o `npx` não existir, traduz para `RuntimeError("npx not found...")`.
+7. **Misturar a música.** `_apply_background_music` (`render_engine.py:925`) só corre **depois** de um render bem-sucedido, porque o HyperFrames já meteu a narração no MP4. `mix_audio_track` (`render_engine.py:831`) volta a correr o `ffmpeg` sobre o ficheiro acabado e substitui-o atomicamente.
+
+`cleanup_render_dirs` (`render_engine.py:677`) remove os `.hf_*` das execuções anteriores, mantendo o que acabou de ser usado — útil para inspeccionar a composição.
+
+### 5.2 A mistura de áudio
+
+O grafo de filtro é escolhido por três funções, todas em `render_engine.py`:
+
+- `_ducked_mix_filter` (`render_engine.py:784`) — voz e cama musical, com a música a ser comprimida por *sidechain* a partir da própria voz. A voz é partida com `asplit` porque é simultaneamente entrada da mistura e chave do *sidechain*.
+- `_flat_mix_filter` (`render_engine.py:805`) — as duas entradas somadas nos seus próprios níveis, sem *ducking*. Aqui a voz **não** é partida: uma segunda saída `asplit` por consumir faz o `ffmpeg` abortar.
+- `_music_only_filter` (`render_engine.py:825`) — só quando `_has_audio_stream` (`render_engine.py:736`) confirma que o vídeo não tem áudio.
+
+`_has_audio_stream` distingue três casos, não dois: `True`, `False` e `None`. `None` significa que o `ffprobe` não conseguiu responder, e isso **não** pode ser confundido com «o vídeo não tem áudio» — o autor do código comenta-o explicitamente.
+
+Os objectivos de nível são centralizados: voz a −6 dBFS, música a −18 dBFS (`music.py:59`), com a biblioteca a normalizar cada faixa para −3 dBFS de pico (`music.py:46`), o que faz um `music_volume` linear de 0.18 assentar perto do alvo.
+
+### 5.3 O motor de render
+
+`HYPERFRAMES_CLI` (`render_engine.py:38`) é `npx.cmd` no Windows e `npx` nos restantes, e `HYPERFRAMES_VERSION` (`render_engine.py:39`) está fixo em `0.8.92`. A versão aparece em três sítios — o comando, o `scripts.render` e o `scripts.check` do `package.json` — e é a mesma constante nos três.
+
+As dimensões vêm de `get_dimensions` (`render_engine.py:218`): `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080, com `vertical` como recurso para qualquer valor desconhecido.
+
+O `_grain_overlay` (`render_engine.py:237`) e a `_progress_bar` (`render_engine.py:256`) usam **passos absolutos em tempos absolutos**, não `infinite`. É uma decisão deliberada: um efeito `infinite` daria um resultado diferente em cada frame, e o render tem de ser reprodutível.
+
+---
+
+## 6. O grafo de módulos do frontend
+
+Módulos ES nativos. `index.html` carrega `auth-handler.js` como script clássico (`frontend/index.html:19`) e `js/main.js` como módulo (`frontend/index.html:20`). Não há *bundler*, não há *transpiler*, não há CDN: os caminhos são relativos, para a página ser servida de `/app/` sem configuração.
+
+```
+main.js ──┬── ui.js
+          ├── api.js
+          ├── state.js
+          ├── catalog.js
+          └── views/  (7 vistas, todas registadas em ROUTES)
+                 ├── dashboard.js ── catalog.js, projects.js, api.js, ui.js
+                 ├── generate.js  ── catalog.js, pickers/presets.js, generator.js
+                 ├── create.js    ── catalog.js, pickers/voices.js, composition.js
+                 ├── studio.js    ── catalog.js, composition.js
+                 ├── projects.js  ── projects.js, api.js, state.js
+                 ├── shorts.js    ── api.js, state.js
+                 └── settings.js  ── catalog.js, api.js
+
+composition.js ── pickers/presets.js, pickers/subtitle.js, pickers/music.js
+pickers/voices.js ── catalog.js
+pickers/music.js   ── catalog.js
+generator.js       ── ui.js, api.js, state.js
+catalog.js         ── api.js, state.js
+```
+
+Três regras que o grafo respeita sem excepções:
+
+- **As vistas nunca falam entre si.** Recebem um `ctx` com `signal`, `navigate`, `params` e `route`.
+- **Só `api.js` toca na rede.** `catalog.js` e as vistas consomem os *wrappers* de `api.js`.
+- **Só `state.js` escreve no estado.** `patch` e `setIn` são as únicas portas de entrada.
+
+### 6.1 O router
+
+`main.js:21` tem uma tabela `ROUTES` com as sete vistas, cada uma com `id`, `label`, `icon` e `render`. O *hash* é a assinatura da vista, não apenas o identificador: navegar de `/studio` para `/studio?project=outro` tem de remontar, senão o novo projecto seria ignorado (`frontend/js/main.js:99`).
+
+Ao trocar de vista, `render` (`frontend/js/main.js:96`) chama `api.abortAll()`, que aborta todos os pedidos em voo, e depois chama o `dispose` da vista anterior. É por isso que nenhum módulo de vista precisa de seardown de temporizadores por conta própria.
+
+`boot` (`frontend/js/main.js:137`) aquece os catálogos de presets e idiomas em paralelo antes do primeiro *paint*, para que os selectores apareçam de imediato.
+
+### 6.2 As preferências
+
+`state.js:75` define o que é persistido: `project`, `voice`, `style`, `music` e `preset`, sob a chave `darkstudio.prefs.v1` (`state.js:9`). Tudo o resto — `script`, `segments`, `storyboard`, `render`, `jobs` — é ** deliberadamente** não persistido, com o comentário do ficheiro a dar a razão: dados do servidor envelhecem, e a interface nunca deve mostrar um número fabricado.
+
+`persist` (`state.js:78`) está dentro de um `try`/`catch`: em modo privado ou com a cota cheia, as preferências simplesmente não sobrevivem. Um armazenamento corrompido também não impede a aplicação de arrancar (`state.js:69`).
+
+### 6.3 Onde as vistas descobrem o que existe
+
+Duas sondas `HEAD` replacing uma chamada completa:
+
+- `hasRenderedVideo` (`frontend/js/api.js:236`) — um `HEAD` contra a mesma rota que o elemento `<video>` usa. `200` significa renderizado, `404` significa nunca gerado. É silenciosa de propósito: um `404` aqui é a resposta, não uma falha a reportar.
+- `probeGenerateRoute` (`frontend/js/api.js:251`) — pergunta se `POST /api/generate` está montado, **antes** de o utilizador carregar no botão. Uma rota que existe mas só aceita `POST` responde `405`; uma rota que não existe responde `404`.
+
+---
+
+## 7. Layout de dados
+
+Tudo o que o utilizador não pode perder vive sob `storage/`, na raiz do projecto (`pipeline.py:39`). As cinco subpastas são as mesmas que o verificador cria e que o entrypoint do contentor garante (`scripts/check_env.py:80`, `docker/entrypoint.sh:55`).
+
+```
+storage/
+├── uploads/        o que o utilizador traz e o que o pipeline intermédio produz
+│   ├── <projeto>.mp3              narração sintetizada, ou áudio carregado
+│   ├── <projeto>.srt              legendas com tempos
+│   ├── <projeto>.script.json      guião guardado por POST /api/script
+│   └── music_upload_<uuid>.<ext>  área de passagem de um upload, já apagada
+├── outputs/        os renders
+│   ├── <projeto>.mp4              o vídeo principal
+│   ├── <projeto>_shorts.mp4       o cut de formato curto
+│   ├── <projeto>.json             o resumo do render, tal como a API o devolveu
+│   └── .hf_<projeto>/             directório de trabalho do HyperFrames
+│       ├── index.html             a composição gerada
+│       ├── hyperframes.json
+│       ├── package.json
+│       └── assets/                media e áudio copiados
+├── media/          media de stock descarregada, por projecto
+├── thumbnails/     thumbnails do pipeline viral
+└── music/          a biblioteca musical
+    ├── uploads.json               manifesto dos uploads do utilizador
+    └── <faixa>.mp3|.wav
+```
+
+Três decisões merecem explicação:
+
+**O directório do HyperFrames vive em `outputs/`, não num temporário.** O comentário em `create_project_dir` (`render_engine.py:643`) diz porquê: um temporário convida o Chrome/Puppeteer a competir com a limpeza.
+
+**Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`). Mesmo quando a transcrição degradou, existe um SRT — o que é pior, num sentido: o pipeline nunca pára, apenas passa a fabricar conteúdo.
+
+**A lista de projectos é derivada, não armazenada.** Não existe base de dados de projectos. `GET /api/projects` (`backend/app.py:1013`) lista os ficheiros de `storage/uploads/`, e é o frontend que os agrupa por nome antes de os mostrar (`frontend/js/projects.js:13`). Um projecto é, operacionalmente, «os ficheiros que partilham um mesmo radical».
+
+### 7.1 O `.env`
+
+O `.env` vive na raiz e é escrito por `POST /api/settings` (`backend/app.py:952`), que o reescreve por inteiro a partir do modelo `ApiSettings` e actualiza também `os.environ` para o processo corrente. As chaves nunca são devolvidas pela API — o `check_env.py` também nunca as imprime, só diz se estão presentes.
+
+Um efeito lateral que vale a pena saber: `POST /api/settings` reescreve o ficheiro com o conjunto fixo de nove chaves. Uma linha que não seja uma dessas, no `.env`, desaparece quando a vista de definições grava.

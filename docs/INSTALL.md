@@ -1,448 +1,383 @@
-# Instalacao — Dark Studio
+# Instalação
 
-Guia passo a passo, **Windows primeiro**. Cada passo indica o comando exato, o que e esperado ver e o que fazer quando falha.
-
-Para a superficie HTTP ver [API.md](API.md). Para o desenho ver [ARCHITECTURE.md](ARCHITECTURE.md).
+Instalação nativa no Windows (plataforma de referência), Linux/macOS e Docker. Para a superfície HTTP ver [API.md](API.md). Para o desenho ver [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## 0. Aviso importante antes de comecar
+## 0. Antes de começar
 
-O brief do projecto menciona sintese de voz, geracao de guiao por IA, temas de legenda e musica de fundo. **Nada disso existe nesta copia do repositorio:**
+Três factos que determinam o resto do guia:
 
-| Falta | Consequencia |
-|-------|--------------|
-| `backend/services/tts.py` | Nao ha voz sintetizada: a narracao tem de vir de um audio que o utilizador carregue. Nao ha `/api/tts`, `/api/voices` nem `/api/languages`. |
-| `backend/services/script_gen.py` | Nao ha geracao de guiao a partir de um tema. Nao ha `/api/script`. |
-| `backend/services/style.py` | Nao ha temas nem estilos de legenda; a tipografia esta fixa no CSS do render. Nao ha `/api/presets`. |
-| `backend/services/music.py` | Nao ha musica de fundo nem `/api/music/*`. |
-
-O caminho Docker **existe** (`Dockerfile`, `docker/entrypoint.sh`, `docker-compose.yml`, `docker-compose.gpu.yml`, `.dockerignore`), mas **nao constrói tal como o repositorio esta** — ver [passo 0.1](#01-o-build-docker-falha-e-porquê) e a [secao 5](#5-docker).
-
-`scripts/check_env.py` tambem nao existe: a pasta `scripts/` esta vazia (só `__pycache__`, e nenhum ficheiro versionado — `git ls-files scripts` nao devolve nada). O `entrypoint.sh:71` trata isso sem quebrar: avisa e faz a verificacao minima dos quatro binarios.
-
-Isto tem uma consequencia concreta e **bloqueante**, tanto no arranque nativo como no build Docker: o `requirements.txt` esta incompleto.
-
-    pip install -r requirements.txt     # completo no papel
-    uvicorn backend.app:app             # ModuleNotFoundError: No module named 'librosa'
-
-Motivo: `backend/services/viral_pipeline.py` faz `import librosa` e `import numpy` no topo do modulo, e `backend/app.py` importa esse modulo no topo. **`librosa` e `numpy` tem de ser instalados a mao**:
-
-    pip install "librosa>=0.10.1" "numpy>=1.24.0"
-
-### 0.1 O build Docker falha, e porquê
-
-O `Dockerfile:333` termina o build com uma verificacao de sanidade deliberadamente estrita:
-
-    /opt/venv/bin/python -c "import fastapi, uvicorn, numpy, soundfile, librosa, edge_tts"
-
-O comentario acima dela explica a intencao: *"um pacote obrigatorio em falta no requirements.txt tem de fazer o BUILD falhar, que e o unico momento em que ainda ha alguem para corrigir"*. A intencao e boa; o problema e que o `requirements.txt` **nao declara nenhum desses quatro pacotes** (`numpy`, `soundfile`, `librosa`, `edge_tts`). O `numpy` chega por via do `faster-whisper`, os outros tres nao chegam por lado nenhum. O build para ali, no ultimo passo, depois de ter feito download do Chrome e construido o virtualenv.
-
-Alem disso o `Dockerfile:283` faz `COPY scripts/ /app/scripts/` sobre uma pasta **sem um unico ficheiro versionado**. Num clone limpo a pasta nem existe e o build falha mais cedo, com um erro de `COPY` pouco explicito.
-
-Dois problemas, entao, e nenhum e do Docker. Corrigir o `requirements.txt` resolve os dois de uma vez, e e a unica correccao que pertence a este projecto:
-
-    pip install "librosa>=0.10.1" "numpy>=1.24.0" soundfile
-
-Requer atencao a `edge_tts`: nao ha modulo de TTS neste repositorio (`backend/services/tts.py` nao existe), logo o `edge-tts` e uma dependencia orfa. A sanidade de build foi escrita para um projecto que tinha TTS.
+- **A raiz não serve a interface.** O backend monta a pasta `frontend/` em `/app` (`backend/app.py:114-116`) e **não existe rota em `/`**. `http://127.0.0.1:8013/` devolve `404`, verificado em execução. A URL da aplicação é `http://127.0.0.1:<porta>/app/`.
+- **A porta nunca é fixa.** O valor por omissão é 8013, mas os dois atalhos procuram a primeira porta livre acima dele. A porta que vai ser usada é impressa no passo `[3/4]`.
+- **Não há autenticação.** O servidor escuta em `127.0.0.1` e qualquer processo local o pode chamar. É uma aplicação de utilizador único; não exponha a porta a uma rede.
 
 ---
 
-## 1. Pre-requisitos
+## 1. Windows
 
-| Componente | Versao | Para que serve | O que acontece sem ele |
-|------------|--------|----------------|------------------------|
-| **Python** | 3.10 ou superior | Servidor e servicos | O arranque falha. |
-| **ffmpeg** + **ffprobe** | qualquer build recente | Medir duracao de audio e video (`pipeline.get_media_duration`), detetar imagens com tela branca (`asset_quality`) | **O servidor arranca e o video sai errado, nao o servidor.** Sem `ffprobe`, a duracao do audio devolve `None`, o storyboard nao e enquadrado na duracao real e o `total_duration` passa a ser o maior `end` do storyboard. Sem `ffmpeg`, `looks_padded` devolve sempre `False` e a rejeicao de assets com canvas branco deixa de funcionar. Nenhum dos dois produz erro visivel. |
-| **Node.js** + **npx** | LTS 20 ou superior | O HyperFrames corre `npx --yes hyperframes@0.8.92 render`, que lanca Chrome headless | **O servidor arranca e o render falha a meio.** `render_with_hyperframes` apanha o `FileNotFoundError` e devolve um payload com `status: "error"` e a mensagem `npx not found. Please install Node.js and npm.` O primeiro render tambem descarrega ~170 MB de Chrome. |
-| **Espaco em disco** | ~1 GB | Chrome descarregado pelo Puppeteer + caches do npm | O render falha ao meio de escrever. |
-| **RAM** | 4 GB (8 GB confortavel) | Chrome a 1080x1920 + ffmpeg + numpy/librosa | O processo morre a meio de um render. |
-| **Rede** | saida HTTPS | OpenRouter, Pexels, Pixabay, download do Chrome | Sem IA o `/api/strategy` cai no fallback local (200, com `source: "fallback-local"`). Sem stock media o video sai com fundos de cor, sem imagens. |
+### 1.1 Python 3.10 ou superior
 
-### Instalar o ffmpeg (Windows)
+Download em <https://www.python.org/downloads/>. No instalador, **marque "Add python.exe to PATH"**. Verifique:
 
-    winget install --id Gyan.FFmpeg -e
+```bat
+python --version
+```
 
-Ou, com Chocolatey:
+O `start.bat` aceita `python`, `py -3` ou o `.venv` do projecto, por esta ordem de preferência (`start.bat:66-75`). Se nenhum responder, o atalho pára com uma mensagem a pedir o Python 3.10+ (`start.bat:82`).
 
-    choco install ffmpeg
+### 1.2 ffmpeg no PATH
 
-Feche e reabra a consola depois de instalar, para o `PATH` ser relido. Verifique:
+`ffmpeg` **e** `ffprobe` são dois executáveis que vêm no mesmo pacote. Não basta ter um deles.
 
-    ffmpeg -version
-    ffprobe -version
+```bat
+winget install --id Gyan.FFmpeg -e
+```
 
-### Instalar o Node.js (Windows)
+Alternativas: `choco install ffmpeg`, ou descompactar o ZIP de <https://www.gyan.dev/ffmpeg/builds/> para uma pasta sem acentos e acrescentar essa pasta ao `PATH`.
 
-Instale o **Node.js LTS** de <https://nodejs.org/en/download>. Deixe marcada a opcao de instalar as ferramentas de native. Verifique:
+Verifique **ambos**:
 
-    node --version
-    npx --version
+```bat
+ffmpeg -version
+ffprobe -version
+```
 
-O `node` tem de estar **no `PATH` da mesma consola** que vai correr o servidor. Se installou o Node e `node --version` nao responder, o `PATH` da sessao ainda esta velho: feche e reabra a consola.
+Sem eles o servidor arranca e a geração de vídeo falha a meio: `asset_quality.py` e `pipeline.py` correm-nos em `subprocess` para medir duração e qualidade, e `render_engine.py` precisa do `ffmpeg` para misturar a música.
 
----
+### 1.3 Node.js LTS
 
-## 2. Windows — instalacao manual, passo a passo
+O render não é Python: o motor chama `npx --yes hyperframes@0.8.92 render` (`render_engine.py:696`), que por sua vez lança Chrome headless. Sem `node`/`npx` não há vídeo.
 
-### Passo 1 — Obter o codigo
+Instale o **LTS** em <https://nodejs.org/en/download>. O Debian 12 traz Node 18, que já está em fim de vida; a imagem Docker usa explicitamente o 22.14.0 (`Dockerfile:23`).
 
-    git clone <url-do-repositorio> Dark-Studio
-    cd Dark-Studio
+```bat
+node --version
+npx --version
+```
 
-Ou descompacte o ZIP em **`C:\Dark-Studio`**. Evite `C:\Program Files\...` e unidades de rede (ver [Resolucao de problemas](#7-resolucao-de-problemas-no-windows)).
+### 1.4 Dependências Python
 
-### Passo 2 — Criar o ambiente virtual
+```bat
+cd C:\Dark-Studio
+python -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip
+.venv\Scripts\python -m pip install -r requirements.txt
+```
 
-**PowerShell:**
+O `.venv` **tem de ser dentro da pasta do projecto**. É o primeiro sítio onde o `start.bat` procura o interpretador, e `check_env.py` só avisa, em vez de falhar, quando o Python é global.
 
-    py -3 -m venv .venv
+O que o `pip` instala, e porque:
 
-**cmd.exe:**
+| Grupo | Pacotes | Observação |
+| --- | --- | --- |
+| Web | `fastapi`, `uvicorn[standard]`, `python-multipart`, `pydantic`, `httpx`, `python-dotenv` | Versões fixadas para instalações reprodutíveis |
+| Áudio/vídeo | `numpy`, `librosa` | Pesados. O primeiro `import librosa` demora vários segundos (numba) |
+| Transcrição | `faster-whisper` | Arrasta `ctranslate2` e `onnxruntime`: download grande. O servidor arranca sem ele |
+| Voz | `edge-tts` | A voz por omissão, sem chave. É o pacote mais importante depois do FastAPI |
+| Testes | `pytest`, `pytest-asyncio`, `requests` | `pytest.ini` usa `asyncio_mode = auto`, que o `pytest-asyncio` fornece |
 
-    python -m venv .venv
+> **Nota sobre o `librosa`.** As linhas 18-22 do `requirements.txt` dizem que `backend/app.py` importa `viral_pipeline` no topo e que sem estes pacotes «o servidor NAO arranca de todo». **Isso já não é verdade**: o import é preguiçoso, dentro de `build_viral` (`backend/app.py:745`), precisamente para o servidor arrancar sem `librosa`. O que continua verdade: sem `librosa`, `POST /api/build-viral` devolve `503`. Por isso o `scripts/check_env.py:48` continua a marcá-lo como obrigatório.
 
-Esperado: aparece `.venv\` com `Scripts\python.exe`. Se `py` nao for reconhecido, use `python`; se `python` nao for reconhecido, instale o Python de <https://www.python.org/downloads/> marcando **"Add python.exe to PATH"**.
+### 1.5 Ficheiro `.env`
 
-> Nao use o Python da Microsoft Store. O stub que a Store instala (`python.exe` de 0 KB que abre a loja em vez de correr) faz o `venv` criar-se sem conteudo e produz um `.venv\Scripts\python.exe` que nao arranca. Instale o Python de python.org, ou desactive os executores em **Definicoes > Aplicacoes > Executores de aplicacao**.
+```bat
+copy .env.example .env
+```
 
-### Passo 3 — Instalar as dependencias
+Abra `.env` e preencha `OPENROUTER_API_KEY` (<https://openrouter.ai/keys>). Sem esta chave o servidor arranca, mas **toda** a geração de texto cai no guião local de recurso. As chaves de stock media (`PEXELS_API_KEY`, `PIXABAY_API_KEY`) são opcionais: sem elas só se usa material local.
 
-**PowerShell:**
+Todas as chaves disponíveis, com o que cada uma liga:
 
-    .\.venv\Scripts\python.exe -m pip install --upgrade pip
-    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+| Variável | Serve | Sem ela |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | guião, estratégia, destaques de shorts | recurso local em tudo o que é texto |
+| `OPENROUTER_MODEL` | modelo `:free` a usar | valor por omissão do `pipeline.DEFAULT_FREE_MODEL` |
+| `PEXELS_API_KEY` | imagens de stock | só material local |
+| `PIXABAY_API_KEY` | imagens e vídeo de stock | só material local |
+| `GEMINI_API_KEY`, `OPENAI_API_KEY`, `YOUTUBE_API_KEY` | fornecedores alternativos de IA | ignorados |
+| `AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION` | TTS da Azure | o `edge-tts` continua a ser o predefinido |
+| `DARK_STUDIO_PORT` | porta base | 8013 |
+| `DARK_STUDIO_PORT_MAX` | limite superior da busca de porta | porta base + 20 |
+| `DARK_STUDIO_ALLOWED_ORIGINS` | origens CORS | `http://127.0.0.1:8013` e `http://localhost:8013` |
+| `DARK_STUDIO_NO_BROWSER` | `1` impede a abertura do navegador | abre |
 
-**cmd.exe:**
+O ficheiro é lido como UTF-8 e as chaves não devem ter acentos. **Nunca** coloque uma chave real no `.env.example`. O `.env` está no `.gitignore`, e a aplicação também o escreve sozinha quando usa `POST /api/settings`.
 
-    .venv\Scripts\python -m pip install --upgrade pip
-    .venv\Scripts\python -m pip install -r requirements.txt
+`OPENROUTER_MODEL` tem de terminar em `:free` — `POST /api/settings` recusa com `400` caso contrário, e o próprio cliente OpenRouter responde `404 "No endpoints found"` para modelos `:free` sem endpoint para a sua chave. Nesse caso, troque de modelo.
 
-Esperado: `Successfully installed fastapi-0.111.0 uvicorn-0.30.1 ...`.
+### 1.6 Correr o verificador
 
-> Use sempre `.venv\Scripts\python.exe -m pip`, **nunca** o `pip` solto — o `pip` solto pode ser de outro Python e instala no sitio errado.
+```bat
+.venv\Scripts\python scripts\check_env.py --fix
+```
 
-### Passo 4 — Instalar o `librosa` e o `numpy` (obrigatorio, ver [passo 0](#0-aviso-importante-antes-de-comecar))
+O `--fix` cria as pastas de `storage/` em falta. Saída 0 se tudo o obrigatório passa, 1 caso contrário. As chaves de API nunca são impressas — o verificador só diz se estão presentes.
 
-    .venv\Scripts\python.exe -m pip install "librosa>=0.10.1" "numpy>=1.24.0"
+### 1.7 Arrancar
 
-Esperado: `Successfully installed librosa-0.10.x numpy-1.26.x ...`. O primeiro `import librosa` demora varios segundos (compila o numba); e normal.
+**Duplo clique em `Abrir Dark Video Studio.bat`**, ou a partir de uma consola, para ver os logs:
 
-### Passo 5 — Configurar as chaves
+```bat
+set DARK_STUDIO_PORT=9000
+start.bat
+```
 
-    copy .env.example .env
+Depois de alguns segundos o navegador abre em `http://127.0.0.1:<porta>/app/`. Se preferir não abrir:
 
-Abra o `.env` num editor e preencha o que quiser usar. **Nunca comite um `.env` com chaves reais** — esta no `.gitignore`, e a aplicacao tambem o escreve sozinha em `POST /api/settings`.
+```bat
+set DARK_STUDIO_NO_BROWSER=1
+start.bat
+```
 
-| Variavel | Obrigatoria | Para que serve |
-|----------|--------------|----------------|
-| `OPENROUTER_API_KEY` | nao | Modelo de IA. Sem ela, `/api/strategy` e os termos visuais por cena caem no fallback local. **Sem esta chave o projecto ainda funciona**: e so menos inteligente. |
-| `OPENROUTER_MODEL` | nao | Tem de terminar em `:free`. Predefinido: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free`. |
-| `PEXELS_API_KEY` | nao | Stock media de <https://www.pexels.com/api/>. |
-| `PIXABAY_API_KEY` | nao | Stock media de <https://pixabay.com/api/docs/>. |
-| `GEMINI_API_KEY`, `OPENAI_API_KEY`, `YOUTUBE_API_KEY` | nao | Mostram-se como `enabled` em `/api/providers`. As duas primeiras activam o caminho multi-fornecedor do gateway de IA. |
-
-Sem nenhuma chave, a aplicacao arranca, aceita um audio, transcreve e rende um video com fundos de cor e sem imagem de stock. Com pelo menos `PEXELS_API_KEY` ou `PIXABAY_API_KEY`, o video tem imagens.
-
-### Passo 6 — Arrancar
-
-    start.bat
-
-Esperado:
-
-    ============================================
-      DARK VIDEO STUDIO - Iniciar Servidor
-    ============================================
-
-    [1/3] A ativar ambiente virtual...
-    [2/3] A iniciar servidor uvicorn na porta 8013...
-    > Servidor: http://127.0.0.1:8013
-    > Interface: http://127.0.0.1:8013/app/
-    > Documentacao: http://127.0.0.1:8013/docs
-    [3/3] A abrir navegador...
-
-O navegador abre sozinho em `http://127.0.0.1:8013/app/`. Se nao abrir, va a esse endereco a mao. Para terminar: `Ctrl+C` na janela do servidor.
-
-> O `start.bat` abre o navegador **antes** do uvicorn estar pronto. Se a pagina carregar em branco na primeira vez, e isso: recarregue (F5) dois segundos depois.
-
-### Passo 7 — Verificar
-
-Noutra consola:
-
-    curl http://127.0.0.1:8013/health
-
-Esperado: `{"status":"ok","message":"Dark Video Studio MVP running"}`
-
-E o estado dos fornecedores:
-
-    curl http://127.0.0.1:8013/api/providers
-
-Se `pexels.enabled` for `false` e voce configurou a chave, o `.env` nao foi lido — reinicie o servidor.
+Para encerrar: `Ctrl+C` na janela.
 
 ---
 
-## 3. Windows — os dois atalhos de arranque
+## 2. Linux e macOS
 
-O repositorio traz dois ficheiros `.bat`. **Nao sao equivalentes.**
+```sh
+sudo apt install ffmpeg          # Debian/Ubuntu
+sudo apt install python3-venv python3-pip
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
 
-| Ficheiro | O que faz | Recomendado |
-|----------|-----------|-------------|
-| `start.bat` | Ativa o `.venv`, arranca o uvicorn na porta 8013 na janela do servidor, abre o navegador. | **Sim.** |
-| `Abrir Dark Video Studio.bat` | Verifica o `.venv`, arranca o uvicorn na 8013 **minimizado** e um `python -m http.server 8080` separado para servir a pasta `frontend/`, abrindo `http://127.0.0.1:8080/`. | Nao. Ver abaixo. |
+cd ~/Dark-Studio
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+cp .env.example .env              # depois editar
 
-Porque nao o segundo:
+.venv/bin/python scripts/check_env.py --fix
+DARK_STUDIO_PORT=9000 sh start.sh
+```
 
-1. Serve a interface na **porta 8080** com um servidor de ficheiros estaticos. A WebUI chama a API com caminhos **relativos** (`const apiBase = ''`, `frontend/index.html:32`), pensados para a mesma origem: servida pelo backend em `/app/` funciona, servida pelo `http.server` cada `fetch('/api/transcribe')` vai parar ao servidor de ficheiros, que responde `404` em HTML, e o `response.json()` lanca a seguir. A pagina aparece com aspecto correcto e **nao faz nada**.
-2. Nao mostra nenhuma janela do servidor, portanto nao ha log nem `Ctrl+C` — fecha-se pelo Gerenciador de Tarefas.
-3. Depende de `Get-NetTCPConnection`, que precisa do modulo NetTCPIP carregado. Se o modulo nao estiver disponivel, o script sai em silencio sem arrancar nada.
+Em macOS, `brew install ffmpeg node`.
 
-Se precisar mesmo de uma interface sem janela do servidor visivel, arranque o `start.bat` normalmente.
+O `start.sh` é `sh`-compatível (sem `[[ ]]`, sem arrays), por isso funciona com o `sh` do sistema. Faz os mesmos quatro passos que o `start.bat`.
 
 ---
 
-## 4. Linux e macOS
+## 3. As chaves de variáveis que o arranque lê
 
-    git clone <url-do-repositorio> Dark-Studio
-    cd Dark-Studio
+| Variável | Efeito | Quem lê |
+| --- | --- | --- |
+| `DARK_STUDIO_PORT` | porta base; se estiver ocupada, procura a seguinte | `check_env.py:303` (quando não lhe é passada no comando), `start.bat:111` |
+| `DARK_STUDIO_PORT_MAX` | limite superior da busca | `check_env.py:307` |
+| `DARK_STUDIO_NO_BROWSER` | `1` não abre o navegador | `start.bat:150`, `start.sh:90` |
+| `DARK_STUDIO_ALLOWED_ORIGINS` | lista CORS separada por vírgulas | `backend/app.py:92`, `backend/app.py:97` |
 
-    python3 -m venv .venv
-    .venv/bin/python -m pip install --upgrade pip
-    .venv/bin/python -m pip install -r requirements.txt
-    .venv/bin/python -m pip install "librosa>=0.10.1" "numpy>=1.24.0"
+Nota sobre a sonda de portas: `start.bat:114` passa a porta base ao verificador como argumento; o `start.sh:65` **não** passa nada e deixa que o `check_env.py` leia a variável de ambiente. O resultado é o mesmo.
 
-    cp .env.example .env      # preencher OPENROUTER_API_KEY e/ou PEXELS_API_KEY
+A sonda é um `bind()` em Python **sem** `SO_REUSEADDR` (`check_env.py:256`), não texto de `netstat`, precisamente para não confundir uma porta em `TIME_WAIT` com uma porta livre.
 
-    # ffmpeg
-    sudo apt install ffmpeg                 # Debian / Ubuntu
-    brew install ffmpeg                     # macOS
+O CORS aceita, sem configuração, qualquer `localhost`, `127.0.0.1` ou `[::1]` em qualquer porta, por causa da expressão regular em `backend/app.py:91`. A lista explícita só é necessária em acesso remoto.
 
-    # Node LTS pelo gestor de pacotes da distro, ou de https://nodejs.org/en/download
+---
 
-    bash start.sh
+## 4. Ver o que está a acontecer
 
-A interface fica em `http://127.0.0.1:8013/app/`.
+O preflight é a primeira coisa que corre e diz exactamente o que falta. As opções:
 
-> `start.sh` tem shebang `#!/usr/bin/env bash` e usa `&>/dev/null`, portanto **tem de ser corrido com `bash`** (ou `chmod +x start.sh` e depois `./start.sh`). `sh start.sh` falha em varios pontos.
+```sh
+python scripts/check_env.py              # relatório
+python scripts/check_env.py --fix        # cria as pastas de storage/ em falta
+python scripts/check_env.py --strict     # avisos também falham (saída 1)
+python scripts/check_env.py --import-check   # importa os pacotes em vez de os procurar (lento)
+python scripts/check_env.py --pick-port  # imprime a primeira porta livre a partir de 8013
+python scripts/check_env.py --check-port 8013   # imprime free ou busy
+```
 
-> O `.venv/` que vem nesta copia do repositorio e um virtualenv **do Windows** (`Lib/`, `Scripts/`, `Include/`). Apague-o antes de seguir estes passos:
->
->     rm -rf .venv
+`--machine` muda a saída do modo de portas para pares `CHAVE=valor`, que é o que os dois atalhos consomem. As 29 verificações cobrem: versão do Python, se está num virtualenv, os dez pacotes obrigatórios, os três de teste, os quatro binários, a escrita em `storage/`, a presença do `.env` e as nove chaves.
+
+Depois, para o servidor:
+
+```bash
+curl -s http://127.0.0.1:8013/health
+curl -s http://127.0.0.1:8013/api/tts/status   # o que é que posso usar agora
+curl -s http://127.0.0.1:8013/api/providers    # que fornecedores estão ligados
+```
+
+`GET /api/tts/status` e `GET /api/providers` devolvem sempre `200`. Um pacote opcional em falta é uma **funcionalidade degradada**, não um pedido falhado — é isso que o painel de definições mostra.
 
 ---
 
 ## 5. Docker
 
-O caminho Docker existe e e serio: `Dockerfile` de tres estagios, `docker/entrypoint.sh` em `sh` (dash, sem bashisms), `docker-compose.yml`, `docker-compose.gpu.yml` e `.dockerignore`, com comentarios a explicar cada decisao. O que **falha hoje e o build** — ver [0.1](#01-o-build-docker-falha-e-porquê).
+### 5.1 O estado real do caminho Docker
 
-### 5.1 O que o build faz
+Verifiquei isto a sério. Resultado:
 
-| Estagio | O que faz |
-|---------|-----------|
-| `browser` | `node:22-bookworm-slim` + Puppeteer, descarrega o Chrome para `/opt/puppeteer` com `PUPPETEER_SKIP_DOWNLOAD=1`. |
-| `builder` | `python:3.12-slim-bookworm` + venv em `/opt/venv`, `pip install -r requirements.txt`. |
-| `runtime` | `python:3.12-slim-bookworm` + Node 22.14.0 + Chrome do estagio `browser` + o venv copiado. Utilizador `darkstudio` (uid 10001), sem privilegios. |
+- **A imagem constrói.** `docker build .` completa os três estágios sem erro. Os dois `docker compose config` (base e com o override de GPU) validam sem queixas.
+- **O contentor não arranca, por causa de uma única linha em falta.** `docker run` sai com código **126** e o log mostra:
+  ```
+  [dark-studio] preflight: a verificar o ambiente...
+  /app/docker/entrypoint.sh: 72: /app/scripts/check_env.py: Permission denied
+  ```
+- **A causa é o bit de execução.** O `Dockerfile:283` faz `COPY scripts/ /app/scripts/` sem modo, e o ficheiro chega à imagem como `-rw-rw-rw-`. Mas `docker/entrypoint.sh:72` invoca-o **directamente** (`"$APP_DIR/scripts/check_env.py" --fix`), o que exige `+x`. Repare no contraste: o `Dockerfile:288` faz `chmod 0755` no `entrypoint.sh`, e o bit ficou lá — a mesma esqueceu-se do `check_env.py`.
+- **Corri-o com `chmod` e o resto está inteiro.** Com o bit posto, o preflight passa (29 verificações, 0 falhas, 11 avisos — todos de chaves em falta), o uvicorn arranca em `0.0.0.0:8013`, e `/health` devolve `200`, `/app/` devolve `200`, `/docs` devolve `200`, `/` devolve `404`, `/api/tts/status` devolve as 53 vozes.
 
-O runtime instala `ffmpeg` (que traz `ffprobe`), `ca-certificates`, `libgomp1` (OpenMP do onnxruntime), `libsndfile1` (o `soundfile` que o `librosa` carrega), `libasound2` (o Chrome precisa de um dispositivo de audio mesmo em headless) e as bibliotecas NSS/GTK do Chrome. Cada uma tem o porque comentado no `Dockerfile`.
+Como não posso tocar em ficheiros de código, a correcção fica aqui para quem a quiser aplicar. Uma linha no `Dockerfile`, depois do `COPY`:
 
-### 5.2 Corrigir o build
+```dockerfile
+RUN chmod 0755 /app/scripts/check_env.py
+```
 
-Antes de conseguir construir, o `requirements.txt` tem de declarar o que o `Dockerfile:333` importa:
+ou, no mesmo `COPY`:
 
-    # em requirements.txt, antes de construir
-    librosa>=0.10.1
-    numpy>=1.24.0
-    soundfile>=0.12.1
+```dockerfile
+COPY --chmod=0755 scripts/ /app/scripts/
+```
 
-E a pasta `scripts/` tem de ter pelo menos um ficheiro versionado, porque o `Dockerfile:283` a copia. Com `scripts/check_env.py` ausente, o `entrypoint.sh:71` ja trata o caso: avisa e corre so a verificacao dos quatro binarios. Para um build limpo, `git add scripts/check_env.py` (ou um `.gitkeep` na pasta) e o `COPY` passa.
+Alternativa sem tocar no `Dockerfile`: montar o projecto por *bind mount* a partir de uma cópia onde o ficheiro já tem o bit, e arrancar com um `ENTRYPOINT` que use o `PATH` do virtualenv em vez da execução directa.
 
-O `edge_tts` da linha 333 e o ponto que exige uma decisao: nao ha modulo de TTS neste repositorio, logo ou se remove da verificacao de sanidade, ou se adiciona o `edge-tts` ao `requirements.txt` para um modulo que nao existe.
+### 5.2 Correr depois da correcção
 
-### 5.3 Correr
+```bash
+cp .env.example .env       # e preencher pelo menos OPENROUTER_API_KEY
+docker compose up -d --build
+```
 
-    cp .env.example .env      # preencher pelo menos OPENROUTER_API_KEY
-    docker compose up -d --build
-    # http://localhost:8013/app/
+A interface fica em <http://localhost:8013/app/>. Para ver os logs:
 
-    docker compose logs -f dark-studio      # preflight + arranque do uvicorn
-    docker compose down                    # parar (o volume sobrevive)
-    docker compose down -v                 # parar e apagar os videos gerados
+```bash
+docker compose logs -f dark-studio
+```
 
-Com GPU — acelera **apenas** o `faster-whisper`. O render corre em Chrome headless com `--disable-gpu`, e o encoder de saida e o ffmpeg:
+### 5.3 O que o compose faz, e porquê
 
-    docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+`docker-compose.yml` (133 linhas) escolhe deliberadamente:
 
-O `docker-compose.gpu.yml` tem de ser usado como sobreposicao, nunca sozinho.
+- **Porta `8013:8013`** (`docker-compose.yml:30`). A porta do contentor tem de bater certo com `DARK_STUDIO_PORT`, porque o entrypoint usa essa variável para ligar o uvicorn (`docker/entrypoint.sh:40`). As duas coisas mudam em conjunto.
+- **`DARK_STUDIO_ALLOWED_ORIGINS` explícita** (`docker-compose.yml:48`). `http://127.0.0.1:8013` e `http://localhost:8013` são origens **diferentes** para o navegador, mesmo que apontem para a mesma máquina. Em acesso remoto, ponha a origem do cliente, e assegure-se de que o servidor está acessível nesse endereço.
+- **Todas as chaves com `${VAR:-}`** (`docker-compose.yml:56`). O compose não falha quando uma chave não existe: passa a string vazia e é a aplicação que degrada. Um `environment: [PEXELS_API_KEY]` sem omissão faria o `docker compose up` abortar por causa de uma chave que a funcionalidade opcional nem usa.
+- **Volume nomeado em `storage/`** (`docker-compose.yml:84`). É o único estado que não pode perder. Sem ele, `docker compose down` apaga tudo o que foi gerado. A pasta é criada dentro da imagem com o owner de `darkstudio` (uid 10001), e um volume vazio montado por cima herda esse owner — por isso o contentor escreve sem root. **Se um volume antigo tiver outro owner, o contentor aborta no arranque**; `docker compose down -v` resolve.
+- **`init: true`** (`docker-compose.yml:99`). PID 1 é o `tini`. O render lança Chrome, que lança subprocess; sem recolher, o contentor acumula processos zombie.
+- **`shm_size: "2gb"`** (`docker-compose.yml:121`). O `/dev/shm` do Docker tem 64 MB por omissão e o Chrome rebenta a escrever um frame de 1080x1920.
+- **`mem_limit` desligado**, com a recomendação comentada (`docker-compose.yml:114`). Um render consome 2-3 GB; com dois, 5-6 GB não é exagerado. Fixar um número sem conhecer o host é a forma rápida de um OOMKill a meio.
 
-### 5.4 O que o compose configura, e o que nao faz
+### 5.4 GPU
 
-| Chave | Efeito real |
-|-------|-------------|
-| `ports: "8013:8013"` | Publica a porta. **E a variavel `DARK_STUDIO_PORT` tem de bater certo com ela**: o `entrypoint.sh:40` le essa variavel para ligar o uvicorn, e o compose nao a usa para construir o `ports:`. Mudar uma sem a outra deixa o container a ouvir num sitio e publicado noutro. |
-| `DARK_STUDIO_PORT` | **Lida** pelo `entrypoint.sh:40` (predefinido 8013). O `start.bat` e o `start.sh` **nao** a leem: no arranque nativo a porta esta fixa em 8013. |
-| `DARK_STUDIO_ALLOWED_ORIGINS` | **Nao e lida por lado nenhum.** O `backend/app.py:46` tem as origens CORS escritas no codigo. O valor que o compose passa nao tem efeito nenhum, e o comentario do compose que explica a necessidade de acesso remoto esta a descrever um mecanismo que nao existe. Para acesso remoto, e preciso editar `backend/app.py`. |
-| `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION` | Passadas ao container, **nao lidas por nenhum modulo** (pertencem ao modulo de TTS, que nao existe). |
-| `volumes: dark-studio-storage` | O unico estado que o utilizador nao pode perder. A pasta e criada na imagem com o owner `darkstudio`; um volume vazio herda esse owner. **Se o volume ja tiver sido criado por outra versao da imagem, o container aborta no arranque** — o `mkdir` do `entrypoint.sh:56` falha com `set -e`. Resolucao: `docker compose down -v`. |
-| `init: true` | `tini` como PID 1, para o Chrome deixar de acumular processos zombie. Com `docker run` directo, usar `--init`. |
-| `shm_size: "2gb"` | O `/dev/shm` do Docker tem 64 MB por omissao e o Chrome rebenta com *"session deleted because of page crash"* num frame de 1080x1920. |
-| `mem_limit` | **Descomentado de proposito.** Chrome a 1080x1920 + ffmpeg + numpy/librosa somam 2-3 GB num render. As sugestoes estao no proprio ficheiro (6 GB para maquinas de 8 GB, 12 GB para 16 GB). |
-| `restart: unless-stopped` | O container volta a levantar depois de um reboot. |
-| `env_file: .env` | `required: false` (Compose >= 2.24), para `docker compose up` funcionar numa maquina limpa. |
-| `logging` | `json-file` com rotacao de 20 MB x 5 ficheiros. |
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
 
-### 5.5 Diagnostico do container
+**O que a GPU compra: só a transcrição.** O `faster-whisper` pode correr em CUDA, porque o `ctranslate2` sabe usar GPU. O override define `WHISPER_DEVICE=cuda` e `WHISPER_COMPUTE_TYPE=float16` (`docker-compose.gpu.yml:76`).
 
-    docker compose ps                 # o container esta "healthy"?
-    docker compose logs dark-studio   # o preflight e o arranque
-    docker compose exec dark-studio sh -c "ffmpeg -version; node --version; python -c 'import librosa'"
+**O que a GPU não compra: o render.** O HyperFrames compõe frames com Chrome headless, e o Chrome neste contentor corre com `--disable-gpu`. Não há aceleração de vídeo no caminho e, mesmo que houvesse, o encoder de saída é o `ffmpeg`, não o Chrome. Isto está escrito no próprio ficheiro (`docker-compose.gpu.yml:14`). Para renders mais rápidos, a resposta é mais CPU e mais RAM.
 
-Sintomas:
+O custo é real: a base CUDA (`nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04`) ocupa 6-8 GB de imagem em vez dos ~2 GB da base Python. Só compensa se a transcrição com whisper for uso diário.
 
-- **O build para em `import fastapi, uvicorn, numpy, soundfile, librosa, edge_tts`** — ver [5.2](#52-corrigir-o-build).
-- **O container reinicia em loop no arranque** — o healthcheck tem `start-period 40s` propositadamente generoso, porque o primeiro arranque importa numpy e librosa (varios segundos). Se mesmo assim reiniciar, o log mostra o motivo: quase sempre e o `mkdir` do `storage/` num volume com owner errado, e resolve-se com `docker compose down -v`.
-- **`ERRO: 'ffmpeg' nao esta no PATH. A imagem esta quebrada.`** — a mensagem do `entrypoint.sh:83`, no caminho sem `check_env.py`. So acontece se a imagem foi construida com a cache de camadas errada; refaca com `--no-cache`.
-- **A porta publicada responde mas a UI nao chama a API** — o backend so aceita `http://127.0.0.1:8013` e `http://localhost:8013`. Aceder por `http://192.168.1.50:8013` da um erro de CORS, e ajustar `DARK_STUDIO_ALLOWED_ORIGINS` **nao resolve**, porque ninguem a le.
+Pré-requisitos, a verificar na sua máquina e não assumidos pelo ficheiro: Docker 19.03+ com o runtime NVIDIA configurado, drivers 525+ e um contentor CUDA que arranque. Teste com:
 
----
+```bash
+docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu22.04 nvidia-smi
+```
 
-## 6. Desenvolvimento a partir do codigo
+Se este comando falhar, o problema é o runtime ou os drivers, não este projecto.
 
-Auto-reload:
+### 5.5 Uma fonte de surpresas: as fontes
 
-    .venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8013 --reload
+Os quatro pacotes de tipografia do `Dockerfile` — `fontconfig`, `fonts-liberation`, `fonts-dejavu-core`, `fonts-noto-color-emoji` (`Dockerfile:211-214`) — **não são opcionais**. A composição queima texto estilizado nos frames. Sem fontes, o Chrome renderiza com o que o `fontconfig` conseguir resolver, as legendas **desaparecem em silêncio**, e o vídeo sai com o áudio e a imagem certos e zero texto, sem qualquer erro em nenhum log. É o único item da imagem cuja ausência produz um resultado errado em vez de uma falha visível — e por isso está descrito como tal no próprio `Dockerfile`.
 
-Correr a suite de testes:
-
-    .venv\Scripts\python.exe -m pytest
-    .venv\Scripts\python.exe -m pytest -m "not slow and not live"   # o mais rapido
-
-259 testes em 10 ficheiros, sem rede por omissao. Detalhes em [README.md](README.md#correr-os-testes).
-
-Linters nao ha: o projecto nao traz `ruff`, `flake8` nem `mypy` configurados. A convencao do codigo e pt-PT em comentarios e mensagens, nomes de simbolo em ingles, e um comentario por bloco que explica o *porque* e nao o *o que*.
+Numa instalação nativa, o mesmo risco existe em Linux: um sistema sem `fonts-liberation` não resolve «Arial» nem «Segoe UI».
 
 ---
 
-## 7. Resolucao de problemas no Windows
+## 6. Testes
 
-### O primeiro diagnostico
+```bash
+python -m pip install -r requirements.txt     # inclui pytest, pytest-asyncio e requests
+pytest -m "not live"
+pytest -m "not live and not slow"              # salta os renders completos
+```
 
-Este checkout **nao tem `scripts/check_env.py`**. Em vez dele, faca estas quatro verificacoes:
+> **`-m "not live"` não é opcional.** O `pytest.ini` declara o marcador `live` e diz como o desmarcar (`pytest.ini:7`), mas **não tem `addopts`**. Um `pytest` sem `-m` chama a OpenRouter e a Pexels a sério e gasta quota real. Isto vale a pena porque o cabeçalho de `tests/test_live_providers.py` afirma que os testes estão «Deselected by default» — não estão. Corrigir isto é uma linha: `addopts = -m "not live"` no `pytest.ini`.
 
-    .venv\Scripts\python.exe -c "import fastapi, uvicorn, numpy, librosa; print('deps OK')"
-    ffmpeg -version
-    node --version
-    curl http://127.0.0.1:8013/health
+Os marcadores disponíveis são `slow` e `live`. Os 16 ficheiros de `tests/` são executados com `asyncio_mode = auto`, sem configuração adicional.
 
-O primeiro comando e o que mais falha: e ele que apanha o `librosa` em falta do `requirements.txt`.
+Dois testes de ponta a ponta usam `timeout=120` num `POST /api/build-video` completo (`tests/test_e2e.py:209`, `tests/test_e2e.py:217`). Numa máquina mais lenta, um render não cabe em 120 s e o teste falha por tempo, não por defeito.
 
-### `ModuleNotFoundError: No module named 'librosa'`
+---
 
-O `requirements.txt` nao declara `librosa`, mas `backend/app.py` importa `viral_pipeline` no topo e esse modulo importa `librosa` no topo. Corrija com:
+## 7. Resolução de problemas
 
-    .venv\Scripts\python.exe -m pip install "librosa>=0.10.1" "numpy>=1.24.0"
+### O navegador abre e mostra «Not Found»
+
+Não está a usar `/app/`. A URL é `http://127.0.0.1:<porta>/app/`. A raiz responde `404` por desenho.
+
+### «Nenhuma porta livre a partir de 8013»
+
+O `netstat -ano -p tcp` impresso pelo `start.bat:120` mostra quem ocupa a porta. Feche o processo, ou mude a base:
+
+```bat
+set DARK_STUDIO_PORT=9000
+start.bat
+```
+
+A busca vai de `DARK_STUDIO_PORT` até `DARK_STUDIO_PORT_MAX`, que por omissão é a base + 20.
+
+### `o .venv existe mas nao executa`
+
+A criação do virtualenv foi interrompida. Apague e refaça:
+
+```bat
+rmdir /s /q .venv
+python -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+O `start.bat:66-69` testa o `.venv` antes de o usar, precisamente para não transformar isto num traceback mais adiante.
 
 ### `npx not found. Please install Node.js and npm.`
 
-O `POST /api/build-video` devolve `200` com `render.status == "error"`. Falta o Node no `PATH` da consola que corre o servidor. Instale o Node LTS, **feche e reabra a consola** (o `PATH` so e relido em novas sessoes) e arranque de novo.
+Falta o Node. Volte ao passo 1.3.
 
-### `[ERROR] Ambiente virtual nao encontrado.`
+### A legenda não aparece no vídeo
 
-O `start.bat` verifica se existe `.venv\Scripts\python.exe`. Crie-o e instale as dependencias (passos 2 e 3). Se a pasta existe mas nao executa — ver antivirus abaixo — apague e refaca:
+Por ordem de probabilidade:
 
-    rmdir /s /q .venv
-    python -m venv .venv
-    .venv\Scripts\python -m pip install -r requirements.txt
+1. **Faltam fontes** (ver [5.5](#55-uma-fonte-de-surpresas-as-fontes)). Sintoma: imagem certa, zero texto, nenhum erro.
+2. `include_captions` foi enviado como `false`, ou `subtitle_style` tem `"mode": "hidden"`.
+3. O `.srt` está vazio ou tem uma única cena.
 
-### Python da Microsoft Store
+### As legendas não batem com a narração
 
-O stub de 0 KB faz `python -m venv .venv` criar um `.venv` sem conteudo. Instale o Python de python.org com **"Add python.exe to PATH"**, ou desative os executores `python.exe` / `python3.exe` em **Definicoes > Aplicacoes > Executores de aplicacao**.
+Não há `faster-whisper` instalado. Verifique com `GET /api/tts/status`. **Atenção:** neste caso o servidor não dá erro nenhum — `pipeline.transcribe_audio_file` engole a excepção e escreve cinco frases fixas de 3 segundos cada (`pipeline.py:84-94`). A resposta é `200` e não existe campo de aviso. Para o distinguir, instale `faster-whisper` e repita.
 
-### A porta 8013 ja esta em uso
+### O guião sai genérico
 
-`[WinError 10048]` ao arrancar o uvicorn. Descubra o dono:
+Falta `OPENROUTER_API_KEY`, ou a quota diária dos modelos `:free` acabou. `GET /api/providers` diz qual dos dois é. O `POST /api/script` marca `degraded` verdadeiro e enche `fallback_error`, mas **devolve `200`** — se a sua aplicação não ler esse campo, a degradação é silenciosa.
 
-    netstat -ano -p tcp | findstr ":8013"
+### «Estado desconhecido» no painel de geração
 
-O ultimo campo e o PID. Encerre-o:
+O painel perdeu o contacto com o servidor a meio de um *poll*. As causas habituais são o servidor ter sido fechado, ou o terminal com o `uvicorn` ter morrido. O trabalho pode continuar no servidor: veja `GET /api/jobs` e o histórico na vista «Projetos». Se preferir acompanhar por script, use `GET /api/jobs/{job_id}` directamente.
 
-    taskkill /PID <pid> /F
+### Erro de CORS
 
-Para mudar a porta, **esta versao do `start.bat` tem-na fixa em dois sitios** (a mensagem e o comando `uvicorn`) e as origens CORS estao fixas em `backend/app.py:46`. Nao existe `DARK_STUDIO_PORT` que faca isto por si. Edite os tres sitios, ou arranque o uvicorn a mao:
+Só em acesso remoto. A origem tem de estar em `DARK_STUDIO_ALLOWED_ORIGINS`, com esquema e porta, exactamente igual à que o navegador mostra na barra de endereço. `localhost:8013` sem esquema não funciona.
 
-    .venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 9000
+### O contentor não arranca (Docker)
 
-### `[WinError 10013]` numa porta que ninguem esta a usar
+É quase certo o caso do ponto [5.1](#51-o-estado-real-do-caminho-docker): `/app/scripts/check_env.py: Permission denied`, saída 126. A correção é um `chmod`.
 
-O Windows reserva faixas de portas para o Hyper-V, o WSL2 e o Xbox Game Bar, e uma porta reservada da `bind()` mesmo sem processo nenhum. O uvicorn recebe `10013` em vez de `10048`.
+### O contentor aborta a escrever em `storage/`
 
-    netsh interface ipv4 show excludedportrange protocol=tcp
+O volume nomeado foi criado por outra versão da imagem, com outro owner. Recrie-o:
 
-Se a 8013 aparecer na faixa reservada, a unica solucao e mudar a porta (acima).
+```bash
+docker compose down -v
+docker compose up -d
+```
 
-### Caminhos com acentos, espacos ou caracteres especiais
+### `docker compose` falha com «service dark-studio has neither an image nor a build context»
 
-O `start.bat` desta versao **nao** faz `cd /d "%~dp0"`, ao contrario do `Abrir Dark Video Studio.bat`, que o faz. Se correr `uvicorn backend.app:app` a partir de outra pasta, o modulo `backend` nao esta no `PYTHONPATH` e o arranque falha com `ModuleNotFoundError: No module named 'backend'`.
+Está a usar o override de GPU sozinho. Ele **não** é um compose completo:
 
-Por isso:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
+```
 
-1. **Clique duas vezes no `start.bat`** — o Windows abre-o ja com a pasta do projecto como pasta de trabalho.
-2. Se precisar de o correr de uma consola, mude primeiro para a pasta.
-3. Se o projecto estiver numa **unidade de rede** (`\\servidor\...`), copie-o para o disco local: o `pip` e a escrita em `storage/` falham em unidades de rede.
-4. Evite uma pasta dentro de `C:\Program Files\` (escrita negada em `storage/`).
+### A primeira chamada a `edge-tts` falha
 
-Os caminhos que o codigo abre (`storage/`, `.env`) resolvem a partir de `BASE_DIR = Path(__file__).resolve().parents[2]` (`backend/services/pipeline.py:34`), pelo que acentos e espacos no nome do projecto nao os corrompem. O que quebra e o arranque a partir da pasta errada.
-
-### O antivirus pôs o `.venv` em quarentena
-
-Sintoma tipico: o `start.bat` diz que o ambiente virtual nao foi encontrado, ou `.venv\Scripts\python.exe` existe mas da erro imediato ao executar. O Windows Defender e algumas suites de seguranca colocam em quarentena os executaveis dentro de pastas `.venv` de projectos recem-clonarados.
-
-1. **Seguranca do Windows > Proteccao contra virus e Ameacas > Historico de Proteccao** e veja o que foi posto em quarentena.
-2. Apague a pasta e refaca a partir do zero — e o caminho mais limpo:
-3. Se nao puder desativar o antivirus (politica da empresa), ponha a pasta do projecto numa excepcao.
-4. Nao marque a pasta do projecto inteira como confiavel se ela estiver num sitio partilhado ou sincronizado.
-
-### A pagina carrega mas nada acontece
-
-Abra a consola do navegador (F12). Ha dois modos de falha, e a mensagem na consola diz qual e:
-
-**`Unexpected token '<'` ou um `404` na resposta.** A interface esta a ser servida por outra coisa que o backend. A WebUI usa caminhos relativos (`const apiBase = ''`, `frontend/index.html:32`), portanto **tem de ser servida pelo proprio backend**, em `/app/`. Em particular:
-
-- Se usou `Abrir Dark Video Studio.bat` (porta 8080, `python -m http.server`), mude para `http://127.0.0.1:8013/app/`.
-- Se abriu o ficheiro com duplo clique (`file:///.../frontend/index.html`), abra pelo backend: nenhum fetch relativo funciona.
-
-**`blocked by CORS policy`.** A origem esta errada. As unicas validas sao `http://127.0.0.1:8013/app/` e `http://localhost:8013/app/`. Se acedeu por `http://[::1]:8013` ou pelo nome da maquina, va a `127.0.0.1`.
-
-### O video sai sem imagens / com fundos de cor
-
-Esperado quando nao ha chave de stock media. `GET /api/providers` mostra `pexels.enabled` e `pixabay.enabled`. Sem nenhuma das duas, `search_media_for_scenes` devolve `{}` e cada cena fica com a cor de fundo — o video renderiza, so sem fotografia. Nao e um bug.
-
-### O video sai com as legendas erradas
-
-Verifique se `faster-whisper` esta instalado:
-
-    .venv\Scripts\python.exe -c "import faster_whisper; print('whisper OK')"
-
-Se nao estiver, `transcribe_audio_file` nao da erro nenhum: devolve cinco frases fixas em portugues com 3 segundos cada. O `/api/transcribe` responde `200` e o SRT fica errado. Compare sempre o texto devolvido com o audio que carregou.
-
-### O primeiro render demora muito
-
-O primeiro `npx --yes hyperframes@0.8.92 render` descarrega o HyperFrames e o Chrome (~170 MB). Os seguintes sao rapidos enquanto a cache do npm estiver intacta. Apagar `%LOCALAPPDATA%\npm-cache` obriga a descarregar de novo.
-
-### `faster-whisper` falha ao descarregar o modelo
-
-O primeiro arranque da transcricao descarrega o modelo Whisper. Sem rede, ou com a cache corrompida, `transcribe_audio_file` engole a excecao e devolve as cinco frases de exemplo (ver acima). Forcar a descarga antes:
-
-    .venv\Scripts\python.exe -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
-
-### Acentos na consola do Windows
-
-`PYTHONUTF8` e `PYTHONIOENCODING` sao o que evita um `UnicodeEncodeError` numa consola cp850. O `start.bat` desta versao define `chcp 65001` mas **nao** exporta as duas variaveis. Se aparecerem erros de codificacao:
-
-    set PYTHONUTF8=1
-    set PYTHONIOENCODING=utf-8
-    .venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8013
-
-### O `.venv` versionado estraga tudo
-
-A pasta `.venv/` na raiz e um virtualenv do Windows versionado por engano (`Lib/`, `Scripts/`, `Include/`). Nao e usada por ninguem e confunde o diagnostico. Apague-a se nao for a sua:
-
-    rmdir /s /q .venv
+O `edge-tts` usa um endpoint gratuito do Microsoft Edge. Se a máquina estiver atrás de uma rede que o bloqueie, a falha é `AUTH_REQUEST_FAILED` com HTTP 502. A alternativa é configurar `AZURE_SPEECH_KEY` e `AZURE_SPEECH_REGION`.
