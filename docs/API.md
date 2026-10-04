@@ -279,7 +279,7 @@ O corpo é JSON lido **cru**, como `Dict[str, Any]` (`backend/app.py:813`), e fi
 
 - **Uma chave desconhecida é descartada, não erra** — verificado: `{"topic": "...", "bogus_key": "x", "mood": "dark"}` devolve `202`. O motivo está no docstring: `submit_job` faz `GenerationRequest(**params)`, por isso uma chave estranha de um cliente mais antigo ou escrito à mão voltaria como `TypeError`.
 - **Não é um modelo Pydantic de propósito**: um modelo duplicaria o dataclass ou transformava um tema em falta num `422` antes que a mensagem em português pudesse ser mostrada. Um corpo vazio, ou um tema em branco, devolve `400` com `"Indique um tema para gerar o video."`.
-- O handler é **`async def` de propósito**: `submit_job` agenda o pipeline no *event loop* em execução (`loop.create_task`, `generator.py:439-443`); uma rota síncrona correria numa *threadpool* sem loop e o job ficaria em fila para sempre.
+- O handler é **`async def` de propósito**: `submit_job` agenda o pipeline no *event loop* em execução (`loop.create_task`, `generator.py:440-444`); uma rota síncrona correria numa *threadpool* sem loop e o job ficaria em fila para sempre.
 
 **Corpo** — os 18 campos do `GenerationRequest`, todos opcionais excepto `topic`:
 
@@ -337,7 +337,7 @@ O nome do projecto não se envia: é derivado de `project_prefix` ou do tema por
 | `400` | `"O volume da música tem de ser um número."` / `"O volume da música tem de estar entre 0 e 1."` | `music_volume` (`generator.py:204-206`) |
 | `500` | `"Falha ao enfileirar a geração: <detalhe>"` | Falha ao enfileirar — é um erro interno, não do chamador (`backend/app.py:832-837`) |
 
-Todas as mensagens de `400` vêm de `GenerationRequest.validate` (`generator.py:153-229`), que valida o primeiro problema e devolve uma cópia com as omissões preenchidas. No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `generator.py:45`); os restantes ficam em fila atrás de um semáforo.
+Todas as mensagens de `400` vêm de `GenerationRequest.validate` (`generator.py:153-229`), que valida o primeiro problema e devolve uma cópia com as omissões preenchidas. No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `generator.py:45`); os restantes ficam à espera de uma *slot* e continuam a reportar `status: "queued"` — só passam a `running` quando obtêm uma das duas. É daí que vem a primeira regra de *poll*: `progress` fica em `0.0` enquanto o job espera e o primeiro valor observável é `0.05`, já dentro da fase `running`.
 
 ---
 
@@ -371,9 +371,9 @@ Cancela um job que ainda não começou.
 
 **404** — `{"detail": "Job não encontrado."}`.
 
-**O que `cancelled` significa, com honestidade.** `cancel_job` só actua quando o estado é `queued` (`generator.py:389-393`): marca o job como `cancelled` e devolve `true`; um job `completed`, `failed` ou já `cancelled` devolve `false`. **Não existe interruptor partilhado**: um HyperFrames já em voo corre até ao fim e o MP4 acaba por ser escrito.
+**O que `cancelled` significa.** `cancel_job` só actua quando o estado é `queued` (`generator.py:393-394`): marca o job como `cancelled`, escreve a mensagem `"Cancelado pelo utilizador antes de começar."` e o erro `"Cancelado pelo utilizador."`, e devolve `true`. Devolve `false` para um job **`running`** e para um job já terminado (`completed`, `failed` ou `cancelled`) (`generator.py:390-401`). O `404` acima é o único sinal de *job inexistente*, por isso `{"cancelled": false}` com `200` quer dizer «não cancelável», nunca «desconhecido» (`backend/app.py:855-864`).
 
-A subtileza que mais surpreende: o estado **nunca passa a `running`** (ver [O objecto job](#o-objecto-job)), por isso um job a meio da geração continua com `status: "queued"` — e `cancel_job` aceita-o, devolvendo `cancelled: true` mesmo assim. O trabalho **não** é interrompido: o render continua até ao fim, e o estado final é uma corrida entre a conclusão e o cancelamento. Pior: se a etapa lançar depois do cancelamento, o *worker* escreve `failed` (`generator.py:512`), o que pode substituir um `cancelled` por um `failed`. Verificado em execução; ver [Limitações conhecidas](../README.md#limitações-conhecidas), pontos 1 e 12, e [ARCHITECTURE.md](ARCHITECTURE.md#44-o-estado-nunca-é-running).
+**O cancelamento só é efectivo antes de o pipeline arrancar.** Um job em fila é mesmo cancelado: o *worker* volta a ler o registo depois de obter a *slot* e aborta se já não o encontrar `queued` (`generator.py:487-491`), pelo que nunca chega a correr uma etapa. Um job **`running`**, pelo contrário, **não se cancela** — a resposta é `{"cancelled": false}` e o trabalho continua até ao fim, com o MP4 escrito na mesma. Não é uma falha do servidor: não existe interruptor partilhado, e interromper o processo a meio do render deixaria um MP4 truncado em `storage/outputs/`. Quem quiser parar um trabalho tem de o cancelar enquanto está `queued`; a partir de `running` só resta esperar por `completed` ou `failed`. Ver [O objecto job](#o-objecto-job) e a secção de jobs e fila em [ARCHITECTURE.md](ARCHITECTURE.md#4-jobs-e-fila).
 
 ---
 
@@ -832,8 +832,8 @@ O que `POST /api/generate` devolve e o que `GET /api/jobs*` lê. `Job.to_dict()`
 
 | Campo | Tipo | Descrição |
 | --- | --- | --- |
-| `job_id` | string | 12 caracteres hexadecimais (`uuid4().hex[:12]`, `generator.py:422`). |
-| `status` | string | `queued`, `completed`, `failed` ou `cancelled`. **Nunca `running`** — ver abaixo. |
+| `job_id` | string | 12 caracteres hexadecimais (`uuid4().hex[:12]`, `generator.py:423`). |
+| `status` | string | `queued`, `running`, `completed`, `failed` ou `cancelled`. Um job à espera de *slot* é `queued`; só passa a `running` quando a obtém — ver abaixo. |
 | `progress` | float | 0.0..1.0. |
 | `stage` | string | `script`, `voice`, `media`, `render` ou `done`. |
 | `message` | string | Mensagem em português do marco actual. |
@@ -845,9 +845,13 @@ O que `POST /api/generate` devolve e o que `GET /api/jobs*` lê. `Job.to_dict()`
 
 `_seq` existe porque os timestamps ISO-8601 só têm granularidade de segundo: dois jobs submetidos no mesmo segundo empatariam em `updated_at`, e o contador é o desempate estável que mantém `GET /api/jobs` novo-primeiro mesmo quando o relógio não avançou (`generator.py:255-259`, ordenação em `generator.py:354-357`).
 
-**O estado nunca é `running`.** `_stage` só mexe em `stage`, `progress` e `message` — nunca em `status` (`generator.py:547-553`). A meio de um job, o snapshot diz `status: "queued"` com `stage: "voice"` e `progress: 0.2`; o progresso em tempo real está em `stage`/`progress`/`message`, não em `status`. Isto afecta o cancelamento — ver [DELETE /api/jobs/{job_id}](#13-delete-apijobsjob_id). O próprio painel trata `queued` como «inactivo» antes de olhar para a etapa, por isso as etapas mostram-se inactivas durante o trabalho (`frontend/js/generator.js:39`).
+**O ciclo de vida observável é `queued` -> `running` -> `completed` | `failed`, mais `cancelled` para um job ainda em fila.** A mudança para `running` acontece no *worker*, no instante a seguir a obter uma das *slots* do semáforo: `_running_ids.add(job_id)` e `job.status = "running"`, em duas linhas seguidas (`generator.py:492-493`), com a primeira marca de etapa logo a seguir (`generator.py:494`). `_stage` continua a mexer só em `stage`, `progress` e `message` — nunca em `status` (`generator.py:550-555`) — por isso é o `status` que diz se o job está à espera ou a trabalhar, e são `stage`, `progress` e `message` que dizem **em que**.
 
-Escada de etapas e progresso (`generator.py:53-57`, `generator.py:566-712`):
+Um cliente distingue as duas fases só por `status`: `queued` significa «à espera de uma *slot* livre» e vem sempre com `progress: 0.0` e `stage: "script"`; `running` significa «tem uma das duas *slots* e está a trabalhar», e é a única fase em que `progress` avança. É também o `status` que decide o cancelamento — ver [DELETE /api/jobs/{job_id}](#13-delete-apijobsjob_id).
+
+O painel espelha a mesma distinção: `queued` mapeia para «inactivo» antes de olhar para a etapa (`frontend/js/generator.js:39`), enquanto `running` mapeia para a etapa real do pipeline (`frontend/js/generator.js:40-47`), com o rótulo de estado `"A trabalhar"` (`frontend/js/generator.js:30`) e a marca `"a correr"` ao lado da etapa activa (`frontend/js/generator.js:96`).
+
+Escada de etapas e progresso (`generator.py:53-57`, `generator.py:595-713`):
 
 | Etapa | Progresso | Mensagem | O que acontece |
 | --- | --- | --- | --- |
@@ -857,9 +861,9 @@ Escada de etapas e progresso (`generator.py:53-57`, `generator.py:566-712`):
 | `render` | `0.60` | `"A renderizar com HyperFrames…"` | `style.resolve_preset_and_style`, `music.pick_track`, `render_engine.render_video_hyperframes` |
 | `done` | `1.00` | `"Vídeo pronto."` | Resultado anexado ao job; `status` passa a `completed` e `message` a `"Vídeo gerado com sucesso."` |
 
-Os valores vivem em constantes nomeadas porque são contrato público: quem os consulta não deve adivinhar.
+Os valores vivem em constantes nomeadas porque são contrato público: quem os consulta não deve adivinhar. Toda a escada corre dentro da fase `running`: um job à espera de *slot* fica em `progress: 0.0` com `stage: "script"` e a mensagem de fila, e só vê `0.05` para `script` depois de obter a *slot* (`generator.py:595`).
 
-**Degradação, nunca falha.** Qualquer falha de etapa é apanhada, o job passa a `status: "failed"` com mensagem em português e `progress: 0.0`, e a excepção é engolida — um job falhado nunca bloqueia a fila nem propaga para quem o chamou (`generator.py:555-563`, com uma segunda rede no *worker* em `generator.py:494-515`). Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)`, para o código sobreviver à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico (`generator.py:504-507`).
+**Degradação, nunca falha.** Qualquer falha de etapa é apanhada, o job passa a `status: "failed"` com mensagem em português e `progress: 0.0`, e a excepção é engolida — um job falhado nunca bloqueia a fila nem propaga para quem o chamou (`generator.py:558-566`, com uma segunda rede no *worker* em `generator.py:495-521`). Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)`, para o código sobreviver à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico (`generator.py:506-510`).
 
 **Concorrência e poda.** No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `generator.py:45`) — cinco renders simultâneos esgotariam a memória de uma máquina normal; o semáforo é criado ao nível do módulo e reutilizado entre *event loops*, porque o `pytest-asyncio` cria um por teste. Jobs terminados com mais de **uma hora** são podados a cada mutação, com um tecto duro de **200** entradas (`MAX_JOB_HISTORY`, `generator.py:49`; `_prune_locked`, `generator.py:310-333`); jobs em fila ou em trabalho **nunca** são podados, ou o servidor perderia trabalho. As leituras públicas devolvem cópias profundas — um cliente não consegue mexer no registo pelo que recebeu (`generator.py:346-349`, `generator.py:362-378`).
 
