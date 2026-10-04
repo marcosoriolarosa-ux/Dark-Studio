@@ -1042,9 +1042,12 @@ async def run_generation(job: Job) -> dict:
     except OSError:
         pass
 
+    output_stem = _output_stem(params, job.job_id, output_dir)
+
     # --------------------------------------------------------------- 0.05 script
     _stage(job, "script", PROGRESS_SCRIPT, "A gerar o guião…")
-    script = script_gen.generate_script(
+    script = await asyncio.to_thread(
+        script_gen.generate_script,
         topic,
         language=params.get("language", DEFAULT_LANGUAGE),
         section_count=params.get("section_count", DEFAULT_SECTION_COUNT),
@@ -1062,30 +1065,33 @@ async def run_generation(job: Job) -> dict:
 
     # --------------------------------------------------------------- 0.20 voice
     _stage(job, "voice", PROGRESS_VOICE, "A sintetizar a narração…")
-    audio_path = upload_dir / f"{slug}.mp3"
-    await tts.synthesize_speech_long(
-        full_text,
-        audio_path,
-        voice=params.get("voice", DEFAULT_VOICE),
-        provider=params.get("tts_provider", DEFAULT_TTS_PROVIDER),
-        rate=params.get("rate", DEFAULT_RATE),
+    audio_path = upload_dir / f"{output_stem}.mp3"
+    await _off_loop(
+        lambda: tts.synthesize_speech_long(
+            full_text,
+            audio_path,
+            voice=params.get("voice", DEFAULT_VOICE),
+            provider=params.get("tts_provider", DEFAULT_TTS_PROVIDER),
+            rate=params.get("rate", DEFAULT_RATE),
+        )
     )
-    segments = pipeline.transcribe_audio_file(audio_path) or []
-    srt_path = upload_dir / f"{slug}.srt"
-    srt_text = pipeline.build_srt_from_segments(segments)
+    captions = await asyncio.to_thread(_build_captions, full_text, audio_path)
+    srt_path = upload_dir / f"{output_stem}.srt"
     try:
-        srt_path.write_text(srt_text, encoding="utf-8")
+        srt_path.write_text(captions.srt_text, encoding="utf-8")
     except OSError as exc:
         return _fail(job, "voice", f"Não foi possível escrever a SRT: {exc}")
 
     # --------------------------------------------------------------- 0.40 media
     _stage(job, "media", PROGRESS_MEDIA, "A buscar imagens de stock…")
-    storyboard = pipeline.build_storyboard_from_segments(segments)
-    scene_media, term_source = pipeline.search_media_for_scenes(
-        storyboard, niche=topic.strip()
+    storyboard = pipeline.build_storyboard_from_segments(captions.segments)
+    scene_media, term_source = await asyncio.to_thread(
+        pipeline.search_media_for_scenes,
+        storyboard,
+        niche=topic.strip(),
     )
-    keywords = pipeline.extract_keywords_from_text(srt_text) or [topic.strip()]
-    global_media = pipeline.search_media_for_keywords(keywords)
+    keywords = pipeline.extract_keywords_from_text(captions.srt_text) or [topic.strip()]
+    global_media = await asyncio.to_thread(pipeline.search_media_for_keywords, keywords)
     media_pool = global_media or [
         item for items in scene_media.values() for item in items
     ]
@@ -1111,23 +1117,21 @@ async def run_generation(job: Job) -> dict:
             params.get("music_mood", DEFAULT_MUSIC_MOOD), exclude_ids=None
         )
         music_track = picked.id if picked else None
-    render_result = await render_engine.render_video_hyperframes(
-        slug,
-        srt_path,
-        storyboard=storyboard,
-        audio_path=audio_path,
-        aspect_ratio=params.get("aspect_ratio", "vertical"),
-        output_stem=slug,
-        preset=params.get("preset", DEFAULT_PRESET),
-        subtitle_style=params.get("subtitle_style"),
-        music_track=music_track,
-        music_volume=params.get("music_volume", DEFAULT_MUSIC_VOLUME),
-        duck_voice=params.get("duck_voice", DEFAULT_DUCK_VOICE),
+    render_result = await _off_loop(
+        lambda: render_engine.render_video_hyperframes(
+            output_stem,
+            srt_path,
+            storyboard=storyboard,
+            audio_path=audio_path,
+            aspect_ratio=params.get("aspect_ratio", "vertical"),
+            output_stem=output_stem,
+            preset=params.get("preset", DEFAULT_PRESET),
+            subtitle_style=params.get("subtitle_style"),
+            music_track=music_track,
+            music_volume=params.get("music_volume", DEFAULT_MUSIC_VOLUME),
+            duck_voice=params.get("duck_voice", DEFAULT_DUCK_VOICE),
+        )
     )
-    # The renderer reports status="error" rather than raising when HyperFrames
-    # itself fails (no CLI, no memory). Treat that as a stage failure so the job
-    # ends FAILED with the renderer's own Portuguese message instead of
-    # "completed" with a broken result.
     if isinstance(render_result, dict) and render_result.get("status") == "error":
         return _fail(
             job,
@@ -1137,14 +1141,22 @@ async def run_generation(job: Job) -> dict:
 
     # ---------------------------------------------------------------- 1.00 done
     _stage(job, "done", PROGRESS_DONE, "Vídeo pronto.")
+    caption_status = pipeline.transcription_status(captions.segments)
+    caption_degraded = caption_status["degraded"] or bool(captions.reasons)
+    degraded = (script_source == "fallback-local") or caption_degraded
+    fallback_error = fallback_error or caption_status.get("fallback_error")
+    if not fallback_error and captions.reasons:
+        fallback_error = captions.reasons[0]
+    actual_duration = _delivered_duration(render_result, storyboard)
+    duration_report = _duration_report(params.get("duration_target"), actual_duration)
     payload = {
         "project_name": slug,
-        "output_stem": slug,
+        "output_stem": output_stem,
         "script": script_dict,
         "script_source": script_source,
         "fallback_error": fallback_error,
-        "degraded": script_source == "fallback-local",
-        "segments": segments,
+        "degraded": degraded,
+        "segments": captions.segments,
         "srt_path": str(srt_path),
         "audio_path": str(audio_path),
         "storyboard": storyboard,
@@ -1158,9 +1170,16 @@ async def run_generation(job: Job) -> dict:
         "music_volume": params.get("music_volume", DEFAULT_MUSIC_VOLUME),
         "duck_voice": params.get("duck_voice", DEFAULT_DUCK_VOICE),
         "render": render_result,
+        "duration_report": duration_report,
+        "caption_builder": captions.builder,
+        "caption_duration_source": captions.duration_source,
+        "caption_reasons": captions.reasons,
     }
+    if not duration_report.get("honoured", True) and duration_report.get("note"):
+        job.message = duration_report["note"]
+    else:
+        job.message = "Vídeo gerado com sucesso."
     job.status = "completed"
     job.result = payload
-    job.message = "Vídeo gerado com sucesso."
     _touch(job)
     return payload

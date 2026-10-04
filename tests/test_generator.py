@@ -108,20 +108,6 @@ def _storyboard():
     ]
 
 
-def _render_result():
-    return {
-        "project_name": "projeto",
-        "output_stem": "projeto",
-        "status": "rendered",
-        "output_path": "/tmp/projeto.mp4",
-        "storyboard": _storyboard(),
-        "scene_count": 3,
-        "scenes_with_media": 3,
-        "preset": "cinematic",
-        "message": "Vídeo renderizado com HyperFrames com sucesso.",
-    }
-
-
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Every test starts from an empty registry and a fresh semaphore."""
@@ -146,20 +132,33 @@ def fake_pipeline(monkeypatch, tmp_path):
         return Path(output_path)
 
     monkeypatch.setattr(gen.tts, "synthesize_speech_long", _fake_tts)
-    monkeypatch.setattr(gen.pipeline, "transcribe_audio_file", lambda path: _segments())
-    monkeypatch.setattr(gen.pipeline, "build_srt_from_segments", lambda segs: _srt_text())
-    monkeypatch.setattr(gen.pipeline, "build_storyboard_from_segments", lambda segs: _storyboard())
+
+    def _assert_no_transcribe(path):
+        raise AssertionError("the generator must not transcribe audio whose text it already has")
+    monkeypatch.setattr(gen.pipeline, "transcribe_audio_file", _assert_no_transcribe)
+    monkeypatch.setattr(gen.pipeline, "get_media_duration", lambda path: 12.0)
     monkeypatch.setattr(gen.pipeline, "search_media_for_scenes", lambda sb, **kw: ({}, "none"))
     monkeypatch.setattr(gen.pipeline, "extract_keywords_from_text", lambda text: ["dinheiro"])
     monkeypatch.setattr(gen.pipeline, "search_media_for_keywords", lambda kw: [])
     monkeypatch.setattr(gen.music, "pick_track", lambda mood, exclude_ids=None: None)
 
     async def _fake_render(*args, **kwargs):
-        # Record the kwargs the orchestrator handed us so the test can assert
-        # the render stage wires preset/subtitle/music through unchanged.
         _fake_render.last_kwargs = dict(kwargs)
         await asyncio.sleep(0)  # yield so tests can observe RUNNING state
-        return _render_result()
+        output_stem = kwargs.get("output_stem", "projeto")
+        output_path = tmp_path / f"{output_stem}.mp4"
+        output_path.write_bytes(b"fake-mp4-bytes")
+        return {
+            "project_name": output_stem,
+            "output_stem": output_stem,
+            "status": "rendered",
+            "output_path": str(output_path),
+            "storyboard": _storyboard(),
+            "scene_count": 3,
+            "scenes_with_media": 3,
+            "preset": kwargs.get("preset", "cinematic"),
+            "message": "Vídeo renderizado com HyperFrames com sucesso.",
+        }
 
     _fake_render.last_kwargs = {}
     monkeypatch.setattr(gen.render_engine, "render_video_hyperframes", _fake_render)
@@ -595,3 +594,134 @@ class TestConcurrencyCap:
         trigger = gen.submit_job({"topic": "trigger"})
         _run(trigger.job_id)
         assert len(gen._jobs) <= gen.MAX_JOB_HISTORY
+
+class TestEventLoopLiveness:
+    def test_no_blocking_work_runs_on_loop_thread(self, fake_pipeline, monkeypatch):
+        """Every blocking stage must execute in a worker thread, not on the loop."""
+        import threading
+        recorded: list = []
+        loop_name = threading.current_thread().name
+
+        def _recorder(name):
+            def decorator(fn):
+                def wrapper(*a, **k):
+                    recorded.append((name, threading.current_thread().name))
+                    return fn(*a, **k)
+                return wrapper
+            return decorator
+
+        monkeypatch.setattr(
+            gen.script_gen, "generate_script",
+            _recorder("script")(gen.script_gen.generate_script),
+        )
+
+        async def _recorder_tts(*a, **k):
+            recorded.append(("tts", threading.current_thread().name))
+            return await gen.tts.synthesize_speech_long(*a, **k)
+        monkeypatch.setattr(gen.tts, "synthesize_speech_long", _recorder_tts)
+
+        async def _recorder_render(*a, **k):
+            recorded.append(("render", threading.current_thread().name))
+            return await gen.render_engine.render_video_hyperframes(*a, **k)
+        monkeypatch.setattr(gen.render_engine, "render_video_hyperframes", _recorder_render)
+
+        original_search_scenes = gen.pipeline.search_media_for_scenes
+        def _recorder_search_scenes(*a, **k):
+            recorded.append(("search_scenes", threading.current_thread().name))
+            return original_search_scenes(*a, **k)
+        monkeypatch.setattr(gen.pipeline, "search_media_for_scenes", _recorder_search_scenes)
+
+        original_search_keywords = gen.pipeline.search_media_for_keywords
+        def _recorder_search_keywords(*a, **k):
+            recorded.append(("search_keywords", threading.current_thread().name))
+            return original_search_keywords(*a, **k)
+        monkeypatch.setattr(gen.pipeline, "search_media_for_keywords", _recorder_search_keywords)
+
+        job = gen.submit_job({"topic": "dinheiro"})
+        _run(job.job_id)
+
+        assert recorded, "No blocking stages were recorded"
+        for stage, thread_name in recorded:
+            assert thread_name != loop_name, f"{stage} ran on loop thread {thread_name}"
+
+
+class TestOutputUniqueness:
+    def test_same_topic_jobs_get_different_stems_and_paths(self, fake_pipeline):
+        """Two same-topic jobs with no prefix must write different paths."""
+        jobs = [gen.submit_job({"topic": "a-historia-da-navegacao-portuguesa"}) for _ in range(2)]
+
+        async def run_both():
+            tasks = [asyncio.create_task(gen._run_job(j.job_id)) for j in jobs]
+            await asyncio.gather(*tasks)
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(run_both())
+        finally:
+            loop.close()
+
+        results = [gen.get_job(j.job_id).result for j in jobs]
+        stems = [r["output_stem"] for r in results]
+        paths = [r["render"]["output_path"] for r in results]
+
+        assert stems[0] != stems[1], "Stems must differ for concurrent same-topic jobs"
+        assert paths[0] != paths[1], "Paths must differ for concurrent same-topic jobs"
+        for path in paths:
+            assert Path(path).exists(), f"Output file must exist: {path}"
+
+    def test_explicit_project_prefix_wins(self, fake_pipeline):
+        """An explicit project_prefix must still win and override the slug."""
+        job = gen.submit_job({
+            "topic": "a-historia-da-navegacao-portuguesa",
+            "project_prefix": "meu-projeto",
+        })
+        _run(job.job_id)
+        result = gen.get_job(job.job_id).result
+        assert result["output_stem"] == "meu-projeto"
+
+
+class TestDegradedCaptions:
+    def test_degraded_true_when_captions_placeholder_regardless_of_script(self, fake_pipeline, monkeypatch):
+        """degraded must be true whenever captions are a placeholder."""
+        monkeypatch.setattr(
+            gen.script_gen, "generate_script",
+            lambda *a, **k: _script(source="openrouter-free", degraded=False),
+        )
+        monkeypatch.setattr(
+            gen.pipeline, "transcription_status",
+            lambda segs: {
+                "transcript_source": "placeholder",
+                "degraded": True,
+                "fallback_error": "As legendas são um placeholder.",
+                "warning": "As legendas são um placeholder.",
+            },
+        )
+        job = gen.submit_job({"topic": "dinheiro"})
+        _run(job.job_id)
+        result = gen.get_job(job.job_id).result
+        assert result["degraded"] is True
+        assert result["fallback_error"] == "As legendas são um placeholder."
+
+    def test_degraded_false_when_script_good_and_captions_ok(self, fake_pipeline):
+        """degraded is false only when both script and captions are fine."""
+        job = gen.submit_job({"topic": "dinheiro"})
+        _run(job.job_id)
+        result = gen.get_job(job.job_id).result
+        assert result["degraded"] is False
+
+
+class TestCaptionsDeriveFromText:
+    def test_srt_and_storyboard_derive_from_full_text(self, fake_pipeline):
+        """The SRT segments and storyboard captions must be substrings of the narration."""
+        job = gen.submit_job({"topic": "dinheiro"})
+        _run(job.job_id)
+        result = gen.get_job(job.job_id).result
+        full_text = result["script"]["full_text"]
+        for scene in result["storyboard"]:
+            caption = scene.get("caption", "")
+            assert caption, "storyboard caption must not be empty"
+            assert caption in full_text, f"Caption '{caption}' is not a substring of the narration"
+        for seg in result["segments"]:
+            text = seg.get("text", "")
+            assert text, "segment text must not be empty"
+            assert text in full_text, f"Segment '{text}' is not a substring of the narration"
