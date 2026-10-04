@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -61,37 +62,258 @@ def format_timestamp(milliseconds: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def transcribe_audio_file(file_path: Path) -> List[Dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Transcription contract
+# ---------------------------------------------------------------------------
+# A transcript we do not have must be impossible to mistake for one we do.
+#
+# This used to be:
+#     try:
+#         from faster_whisper import WhisperModel
+#         ...
+#         if results:
+#             return results
+#     except Exception:
+#         pass
+#     return [{"index": i + 1, "start": i * 3.0, "end": (i + 1) * 3.0, "text": phrase}
+#             for i, phrase in enumerate(FIVE_FIXED_PORTUGUESE_PHRASES)]
+#
+# faster-whisper is an optional dependency (requirements.txt, "opcional em tempo
+# de arranque") and normally absent, so that fallback fired on EVERY job: a
+# 27 MB video with correct narration, captions about commuters and yoga mats
+# invented out of five hardcoded sentences, and `degraded: false` on the way
+# out. The SRT also claimed 15 s of captions over 12.384 s of audio, which is
+# what truncated the last scene to 0.384 s.
+#
+# The contract now, and it is deliberately narrow:
+#   * real segments             -> no marker on any segment; transcription_status()
+#                                  reports degraded False;
+#   * faster-whisper missing    -> exactly one segment marked `placeholder: True`
+#                                  carrying the reason and the fix, clamped to the
+#                                  real audio duration. With allow_placeholder=False
+#                                  it raises TranscriptionDependencyMissing instead;
+#   * whisper ran and failed    -> raises TranscriptionFailed with the real error.
+# No plausible-looking filler is ever returned: the placeholder says, in the
+# caption itself, that it is not a transcript.
+#
+# The return type is unchanged, so all four call sites keep working untouched;
+# they only have to *look* at the result (see transcription_status).
+
+# The key that marks a segment as a stand-in for a transcript. Constant so a
+# caller never hardcodes the string.
+TRANSCRIPT_PLACEHOLDER_KEY = "placeholder"
+
+# Values for `placeholder_reason`.
+REASON_WHISPER_MISSING = "faster-whisper-not-installed"
+REASON_TRANSCRIPT_UNAVAILABLE = "transcription-unavailable"
+
+# The one command that fixes the common case. Named in every user-visible message.
+INSTALL_HINT = "pip install faster-whisper"
+
+WHISPER_MISSING_MESSAGE = (
+    "Legendas automáticas indisponíveis: o pacote opcional 'faster-whisper' não "
+    "está instalado, por isso esta narração não foi transcrita. O texto das "
+    "legendas é um aviso, NÃO a fala do áudio. Instale com '"
+    + INSTALL_HINT
+    + "' e repita, ou gere as legendas a partir do texto com "
+    "pipeline.build_srt_from_text."
+)
+
+TRANSCRIPT_EMPTY_MESSAGE = (
+    "Não foi possível obter um transcript real: a transcrição não devolveu "
+    "nenhum segmento. Verifique se o áudio é válido e tem fala, e instale o "
+    "transcritor com '" + INSTALL_HINT + "'."
+)
+
+# Kept short on purpose: build_storyboard_from_segments truncates a caption at
+# 80 characters, and the marker has to survive that truncation to stay visible
+# in the rendered video and in the SRT.
+PLACEHOLDER_TEXT = (
+    "[SEM TRANSCRIÇÃO: faster-whisper não instalado - " + INSTALL_HINT + "]"
+)
+
+# Only used when ffprobe cannot tell us how long the audio is. Short on purpose:
+# under-claiming the caption length is harmless (the video just stops captioning),
+# over-claiming truncates the last scene, which is the bug this file used to have.
+PLACEHOLDER_FALLBACK_DURATION = 5.0
+
+
+class TranscriptionError(RuntimeError):
+    """No real transcript was produced, and the caller must not pretend otherwise."""
+
+
+class TranscriptionDependencyMissing(TranscriptionError):
+    """faster-whisper is not installed. Optional dependency; the fix is to install it."""
+
+
+class TranscriptionFailed(TranscriptionError):
+    """faster-whisper ran and failed, or found no speech. str(exc) is the real cause."""
+
+
+def _audio_duration(file_path: Path) -> tuple[float, bool]:
+    """(seconds, known) for ``file_path``, from ffprobe, with a safe default.
+
+    The fallback is deliberately short. A caption shorter than the audio only ends
+    early; a caption longer than the audio truncates the last scene, which is the
+    bug this file used to have.
+    """
+    try:
+        probed = get_media_duration(Path(file_path))
+    except Exception:
+        probed = None
+    if probed is not None and probed > 0:
+        return round(float(probed), 3), True
+    return PLACEHOLDER_FALLBACK_DURATION, False
+
+
+def _placeholder_transcript(
+    file_path: Path,
+    reason: str,
+    message: str,
+) -> List[Dict[str, Any]]:
+    """One obviously-fake segment, timed to the real audio.
+
+    Kept to a single segment on purpose: any longer placeholder would be more
+    invented content, and one segment is enough to carry the SRT, keep the
+    storyboard buildable, and make the failure impossible to miss.
+    """
+    duration, duration_known = _audio_duration(file_path)
+    return [
+        {
+            "index": 1,
+            "start": 0.0,
+            "end": duration,
+            "text": PLACEHOLDER_TEXT,
+            TRANSCRIPT_PLACEHOLDER_KEY: True,
+            "placeholder_reason": reason,
+            "placeholder_message": message,
+            "duration_known": duration_known,
+        }
+    ]
+
+
+def transcribe_audio_file(
+    file_path: Path,
+    *,
+    allow_placeholder: bool = True,
+) -> List[Dict[str, Any]]:
+    """Transcribe ``file_path`` with faster-whisper into SRT-shaped segments.
+
+    Returns a list of ``{"index", "start", "end", "text"}`` dicts, exactly as
+    before, and never pads it with invented narration. Three outcomes, all
+    distinguishable by the caller:
+
+    * real transcript -> no segment carries ``placeholder``;
+      ``is_placeholder_transcript(segments)`` is False and
+      ``transcription_status(segments)["degraded"]`` is False.
+    * faster-whisper not installed -> a single segment marked ``placeholder:
+      True`` with ``placeholder_reason`` and a Portuguese
+      ``placeholder_message`` naming the cause and the fix. Pass
+      ``allow_placeholder=False`` to get ``TranscriptionDependencyMissing``
+      raised instead, for callers that would rather fail than caption a warning.
+    * the model ran and failed, or returned nothing -> ``TranscriptionFailed``
+      carrying the real error. Never swallowed, never replaced by filler.
+    """
     try:
         from faster_whisper import WhisperModel
+    except ImportError as exc:
+        if not allow_placeholder:
+            raise TranscriptionDependencyMissing(WHISPER_MISSING_MESSAGE) from exc
+        return _placeholder_transcript(file_path, REASON_WHISPER_MISSING, WHISPER_MISSING_MESSAGE)
 
+    try:
         model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(str(file_path), language="pt", beam_size=5)
+        # faster-whisper decodes lazily: `decoded` is a generator, so a corrupt
+        # file or a missing onnxruntime raises HERE, during iteration, not at the
+        # call above. The loop has to stay inside this try.
+        decoded, _info = model.transcribe(str(file_path), language="pt", beam_size=5)
+        results: List[Dict[str, Any]] = []
+        for seg in decoded:
+            text = str(seg.text).strip()
+            if not text:
+                continue
+            results.append(
+                {
+                    "index": len(results) + 1,
+                    "start": max(0.0, float(seg.start)),
+                    "end": max(0.0, float(seg.end)),
+                    "text": text,
+                }
+            )
+    except Exception as exc:
+        raise TranscriptionFailed(
+            "A transcrição de " + Path(file_path).name + " falhou: " + str(exc)
+        ) from exc
 
-        results = []
-        for seg in segments:
-            results.append({
-                "index": len(results) + 1,
-                "start": float(seg.start),
-                "end": float(seg.end),
-                "text": str(seg.text).strip(),
-            })
-        if results:
-            return results
-    except Exception:
-        pass
+    if not results:
+        raise TranscriptionFailed(
+            "A transcrição de " + Path(file_path).name
+            + " não devolveu nenhum segmento (áudio inválido ou sem fala). "
+            + TRANSCRIPT_EMPTY_MESSAGE
+        )
 
-    phrases = [
-        "A rotina moderna nos consome em excesso.",
-        "As pessoas passam o dia correndo contra o tempo.",
-        "O corpo humano foi feito para se mover.",
-        "A atividade física melhora a saúde mental.",
-        "A consistência é mais importante do que intensidade.",
-    ]
-    return [
-        {"index": i + 1, "start": i * 3.0, "end": (i + 1) * 3.0, "text": phrase}
-        for i, phrase in enumerate(phrases)
-    ]
+    return results
+
+
+def is_placeholder_transcript(segments: List[Dict[str, Any]] | None) -> bool:
+    """True when the transcript is a stand-in rather than something whisper heard."""
+    return any(bool(seg.get(TRANSCRIPT_PLACEHOLDER_KEY)) for seg in segments or [])
+
+
+def transcript_issue(segments: List[Dict[str, Any]] | None) -> Dict[str, Any] | None:
+    """Why this transcript is not real, or None when it is.
+
+    Returns ``{"reason", "message", "duration_known"}``. ``message`` is the
+    Portuguese text to show a user: it names the real cause and the fix.
+    """
+    for seg in segments or []:
+        if seg.get(TRANSCRIPT_PLACEHOLDER_KEY):
+            return {
+                "reason": str(seg.get("placeholder_reason") or REASON_TRANSCRIPT_UNAVAILABLE),
+                "message": str(seg.get("placeholder_message") or TRANSCRIPT_EMPTY_MESSAGE),
+                "duration_known": bool(seg.get("duration_known", True)),
+            }
+    return None
+
+
+def transcription_status(segments: List[Dict[str, Any]] | None) -> Dict[str, Any]:
+    """Honest degradation block for the result dict the API and the WebUI carry.
+
+    Merge it into a payload rather than guessing::
+
+        status = transcription_status(segments)
+        payload.update(status)
+        payload["degraded"] = payload["degraded"] or status["degraded"]
+        payload["fallback_error"] = payload["fallback_error"] or status["fallback_error"]
+
+    ``degraded`` is True for a placeholder transcript AND for an empty one, so a
+    caller can never report success over a transcript it does not have. The
+    ``fallback_error``/``warning`` pair matches the existing script_gen
+    convention (``degraded`` + ``fallback_error``) that the WebUI already reads.
+    """
+    if not segments:
+        return {
+            "transcript_source": "none",
+            "degraded": True,
+            "fallback_error": TRANSCRIPT_EMPTY_MESSAGE,
+            "warning": TRANSCRIPT_EMPTY_MESSAGE,
+        }
+
+    issue = transcript_issue(segments)
+    if issue is None:
+        return {
+            "transcript_source": "faster-whisper",
+            "degraded": False,
+            "fallback_error": None,
+            "warning": None,
+        }
+
+    return {
+        "transcript_source": "placeholder",
+        "degraded": True,
+        "fallback_error": issue["message"],
+        "warning": issue["message"],
+    }
 
 
 def build_srt_from_segments(segments: List[Dict[str, Any]]) -> str:
@@ -104,6 +326,148 @@ def build_srt_from_segments(segments: List[Dict[str, Any]]) -> str:
         lines.append(seg["text"])
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+# Used when the caller knows the narration text but has no usable duration.
+DEFAULT_SRT_DURATION = 8.0
+# Floor for a single caption, so a very short audio can never produce a
+# zero-length cue.
+MIN_SRT_SEGMENT_SECONDS = 0.2
+# Reading speed sanity check: 84 characters is two comfortable lines.
+DEFAULT_CAPTION_CHARS = 84
+
+# Sentence boundaries a caption may be split after. Kept conservative so an
+# abbreviation like "Sr." does not become a cue of its own too often.
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _pack_captions(text: str, max_chars: int) -> List[str]:
+    """Split ``text`` into caption-sized chunks, sentence-aligned where possible.
+
+    Whole words only, in input order, joined by single spaces: a caption is
+    always a contiguous run of the input, never an edited paraphrase of it.
+    """
+    sentences = [part.strip() for part in _SENTENCE_SPLIT.split(text) if part.strip()]
+    captions: List[str] = []
+    current: List[str] = []
+
+    for sentence in sentences:
+        words = sentence.split()
+        if not words:
+            continue
+        if current and len(" ".join(current + words)) <= max_chars:
+            current.extend(words)
+            continue
+        if current:
+            captions.append(" ".join(current))
+            current = []
+        # A single sentence longer than max_chars gets word-packed instead of
+        # being cut mid-word.
+        for word in words:
+            if current and len(" ".join(current + [word])) > max_chars:
+                captions.append(" ".join(current))
+                current = []
+            current.append(word)
+
+    if current:
+        captions.append(" ".join(current))
+    return captions
+
+
+def build_srt_from_text(text: str, duration: float, *, max_chars: int = 84) -> List[Dict[str, Any]]:
+    """Build SRT-shaped caption segments from text that is already known.
+
+    WHY this exists: every narration this app produces is synthesised from a
+    string the caller is already holding. ``/api/tts`` receives ``text``;
+    ``/api/generate`` receives ``script.full_text``. Running speech recognition
+    on audio synthesised from that string recovers a slightly worse copy of text
+    we already have, costs a model load plus a full decode, and -- when
+    faster-whisper is not installed -- used to fall through to five invented
+    Portuguese sentences. Splitting the known text is cheaper, faster, exact,
+    and structurally cannot fabricate content.
+
+    Returns ``[{"index", "start", "end", "text"}]``, the same shape
+    ``transcribe_audio_file`` returns, so the result can be written by
+    ``build_srt_from_segments`` and consumed by ``build_storyboard_from_segments``
+    unchanged.
+
+    Captions are contiguous runs of whole words from ``text`` in order, packed at
+    sentence boundaries up to ``max_chars``. Timings are distributed across
+    ``duration`` in proportion to caption length and clamped to it, so an SRT
+    built from known text can never claim more time than the audio has. Empty or
+    whitespace-only text returns ``[]`` rather than raising. A non-positive,
+    non-finite or unusable ``duration`` falls back to ``DEFAULT_SRT_DURATION``, so
+    a caption always has a positive length.
+    """
+    if not text or not str(text).strip():
+        return []
+
+    try:
+        total = float(duration)
+    except (TypeError, ValueError):
+        total = 0.0
+    # Below the per-caption floor there is no room for a caption with a positive
+    # length, so such a duration is as unusable as a negative one: use the
+    # default rather than emit a zero-length cue.
+    if not math.isfinite(total) or total < MIN_SRT_SEGMENT_SECONDS:
+        total = DEFAULT_SRT_DURATION
+
+    try:
+        limit = int(max_chars)
+    except (TypeError, ValueError):
+        limit = DEFAULT_CAPTION_CHARS
+    if limit <= 0:
+        limit = DEFAULT_CAPTION_CHARS
+
+    # Collapse whitespace once: a blank line inside a cue would terminate it in
+    # the SRT, and a caption is then a contiguous run of the normalised text.
+    captions = _pack_captions(" ".join(str(text).split()), limit)
+    if not captions:
+        return []
+
+    weights = [float(len(caption)) for caption in captions]
+    weight_total = sum(weights) or float(len(captions))
+    # Reserve the per-caption floor first, then share what is left in proportion
+    # to caption length. The floor is a floor, not a split point: on audio too
+    # short to hold every caption the surplus is merged into its neighbour
+    # instead of being dropped, so no narration is ever lost.
+    reserved = min(total, len(captions) * MIN_SRT_SEGMENT_SECONDS)
+    scale = (total - reserved) / weight_total
+
+    segments: List[Dict[str, Any]] = []
+    cursor = 0.0
+    last = len(captions) - 1
+    for position, caption in enumerate(captions):
+        start = min(round(cursor, 3), total)
+        if position == last:
+            end = round(total, 3)
+        else:
+            end = round(min(total, cursor + max(MIN_SRT_SEGMENT_SECONDS, weights[position] * scale)), 3)
+
+        if end <= start:
+            # The timeline ran out (audio shorter than the caption floor). Fold
+            # the text into the previous caption rather than emit a cue with no
+            # length, which the SRT writer and the renderer both mishandle.
+            if segments:
+                segments[-1]["text"] = segments[-1]["text"] + " " + caption
+                continue
+            segments.append({
+                "index": 1,
+                "start": 0.0,
+                "end": round(total, 3),
+                "text": caption,
+            })
+            continue
+
+        segments.append({
+            "index": len(segments) + 1,
+            "start": start,
+            "end": end,
+            "text": caption,
+        })
+        cursor = end
+
+    return segments
 
 
 # Words that appear constantly in narration but tell a stock-photo search nothing.
