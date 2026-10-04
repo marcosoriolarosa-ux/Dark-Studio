@@ -8,16 +8,16 @@ Todas as contagens vêm de `wc -l` sobre a árvore actual.
 
 ## 1. Mapa de módulos
 
-### Backend — 8433 linhas
+### Backend — 8681 linhas
 
 | Módulo | Linhas | Responsabilidade |
 | --- | --- | --- |
 | `backend/app.py` | 1048 | 27 rotas FastAPI, CORS, montagem de `/app`, modelos Pydantic, saneamento de nomes |
-| `backend/services/render_engine.py` | 1172 | Composição HTML, HyperFrames via `npx`, mistura de música com `ffmpeg`, directório de projecto |
+| `backend/services/render_engine.py` | 1417 | Composição HTML, HyperFrames via `npx`, mistura de música com `ffmpeg`, directório de projecto |
 | `backend/services/provider_registry.py` | 1026 | Registo de fornecedores de IA, chaves múltiplas, memória de quota, retentativas |
 | `backend/services/music.py` | 798 | Biblioteca musical: 6 faixas sintetizadas, uploads, manifesto, loop e parâmetros de mistura |
 | `backend/services/pipeline.py` | 739 | Transcrição, SRT, palavras-chave, storyboard, pesquisa de media, cache |
-| `backend/services/generator.py` | 712 | Orquestrador de um clique, registo de jobs, fila, marcos de progresso |
+| `backend/services/generator.py` | 715 | Orquestrador de um clique, registo de jobs, fila, marcos de progresso |
 | `backend/services/style.py` | 626 | 8 temas, `SubtitleStyle`, validação e vocabulários fechados |
 | `backend/services/tts.py` | 582 | 53 vozes `edge-tts`, OpenAI e Azure; divisão de texto longo; estado de disponibilidade |
 | `backend/services/script_gen.py` | 575 | Guião em 5 idiomas, recurso local, extracção de termos visuais |
@@ -27,13 +27,13 @@ Todas as contagens vêm de `wc -l` sobre a árvore actual.
 | `backend/services/auth_contract.py` | 143 | Seis códigos `AUTH_*`, `AuthError`, mapeamento de estados HTTP |
 | `backend/services/__init__.py` | 1 | — |
 
-### Frontend — 5358 linhas, das quais 3900 de JavaScript
+### Frontend — 5642 linhas, das quais 4184 de JavaScript
 
 | Ficheiro | Linhas | Papel |
 | --- | --- | --- |
 | `frontend/styles.css` | 1394 | Todo o aspecto visual; sem dependências externas |
 | `frontend/js/ui.js` | 363 | Fabrico de DOM: `el`, `card`, `banner`, `toast`, `badge`, campos, `skeletonStack` |
-| `frontend/js/generator.js` | 288 | Painel de progresso do fluxo de um clique: etapas, barra, *poll* |
+| `frontend/js/generator.js` | 296 | Painel de progresso do fluxo de um clique: etapas, barra, *poll* |
 | `frontend/js/views/create.js` | 297 | Vista «Criar» — onde se escreve o tema |
 | `frontend/js/views/generate.js` | 278 | Vista «Gerar» — briefing e submeter o `POST /api/generate` |
 | `frontend/js/views/shorts.js` | 276 | Vista «Formatos curtos» |
@@ -45,6 +45,7 @@ Todas as contagens vêm de `wc -l` sobre a árvore actual.
 | `frontend/js/main.js` | 198 | Router por *hash*, ciclo de vida das vistas, erro global |
 | `frontend/js/pickers/music.js` | 185 | Selector de ambiente e faixa |
 | `frontend/js/pickers/voices.js` | 167 | Selector de voz, agrupado por locale |
+| `frontend/js/views/dashboard.js` | 167 | Vista «Painel» — o que o servidor consegue fazer e o que já foi feito |
 | `frontend/js/pickers/subtitle.js` | 155 | Editor de estilo de legenda: cor, tamanho, posição, modo |
 | `frontend/js/state.js` | 120 | Store observável mínimo; `localStorage` para preferências |
 | `frontend/js/catalog.js` | 102 | Cache preguiçosa dos catálogos partilhados entre vistas |
@@ -53,13 +54,13 @@ Todas as contagens vêm de `wc -l` sobre a árvore actual.
 | `frontend/index.html` | 64 | Casca: barra lateral, *crumb*, contentor `#ds-view` |
 | `frontend/auth-handler.js` | 299 | Contrato `AUTH_*` no navegador. **Não modificado**, carregado como script clássico |
 
-Os 18 módulos de `frontend/js/` (excluindo `auth-handler.js`) somam 3601 linhas.
+Os 19 módulos de `frontend/js/` (excluindo `auth-handler.js`) somam 3885 linhas.
 
 ### Restante da árvore
 
 | Ficheiro | Linhas |
 | --- | --- |
-| `tests/*.py` (16 ficheiros) | 6653 |
+| `tests/*.py` (16 ficheiros) | 7419 |
 | `scripts/check_env.py` | 441 |
 | `Dockerfile` | 353 |
 | `start.bat` | 165 |
@@ -69,7 +70,7 @@ Os 18 módulos de `frontend/js/` (excluindo `auth-handler.js`) somam 3601 linhas
 | `start.sh` | 96 |
 | `requirements.txt` | 56 |
 | `.env.example` | 50 |
-| `pytest.ini` | 6 |
+| `pytest.ini` | 24 |
 | `Abrir Dark Video Studio.bat` | 10 |
 
 ---
@@ -92,7 +93,7 @@ O frontend segue a mesma ideia. `frontend/js/api.js` é a única costura de rede
 
 ### 3.1 O caminho de um clique
 
-`generator.run_generation` (`generator.py:566`) conduz quatro etapas. O progresso é escrito por `_stage` (`generator.py:547`), que só mexe em `stage`, `progress` e `message` — **nunca** em `status`.
+`generator.run_generation` (`generator.py:569`) conduz quatro etapas. O progresso é escrito por `_stage` (`generator.py:550`), que só mexe em `stage`, `progress` e `message` — **nunca** em `status`.
 
 | # | Etapa | Progresso | Chamadas |
 | --- | --- | --- | --- |
@@ -104,11 +105,11 @@ O frontend segue a mesma ideia. `frontend/js/api.js` é a única costura de rede
 
 Antes da etapa 1, `_project_slug` (`generator.py:82`) deriva o nome do projecto a partir de `project_prefix`, ou do tema. `slugify_topic` (`generator.py:98`) normaliza com NFKD, decompõe os acentos e reduz tudo o que não for alfanumérico a um hífen. O resultado nunca tem separadores de caminho nem `..`.
 
-**A degradação nunca é uma excepção.** Qualquer falha de etapa passa por `_fail` (`generator.py:555`), que escreve `status: "failed"`, uma mensagem em português e `progress: 0.0`, e devolve `{}`. O `_run_job` tem uma segunda rede (`generator.py:494`) para o caso de a excepção escapar do `run_generation`.
+**A degradação nunca é uma excepção.** Qualquer falha de etapa passa por `_fail` (`generator.py:558`), que escreve `status: "failed"`, uma mensagem em português e `progress: 0.0`, e devolve `{}`. O `_run_job` tem uma segunda rede (`generator.py:497`) para o caso de a excepção escapar do `run_generation`.
 
-Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)` (`generator.py:506`), para que o código sobreviva à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico.
+Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)` (`generator.py:509`), para que o código sobreviva à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico.
 
-O `render_engine` não levanta quando o HyperFrames falha: devolve `status: "error"`. Por isso o pipeline trata esse caso como falha de etapa (`generator.py:677`), para o job não acabar `completed` com um resultado partido.
+O `render_engine` não levanta quando o HyperFrames falha: devolve `status: "error"`. Por isso o pipeline trata esse caso como falha de etapa (`generator.py:680`), para o job não acabar `completed` com um resultado partido.
 
 ### 3.2 O caminho manual
 
@@ -180,7 +181,7 @@ A ordenação usa `updated_at` **e** `_seq` (`generator.py:356`). Os timestamps 
 
 ### 4.2 Submeter
 
-`submit_job` (`generator.py:405`) valida, regista um job `queued` e devolve **imediatamente**. A validação é `GenerationRequest.validate` (`generator.py:153`), que devolve uma cópia com as omissões preenchidas e todos os campos dentro dos limites, levantando `ValueError` com mensagem em português no primeiro problema.
+`submit_job` (`generator.py:406`) valida, regista um job `queued` e devolve **imediatamente**. A validação é `GenerationRequest.validate` (`generator.py:153`), que devolve uma cópia com as omissões preenchidas e todos os campos dentro dos limites, levantando `ValueError` com mensagem em português no primeiro problema.
 
 Depois, se houver um event loop a correr, `loop.create_task` agenda o worker. Se não houver — um teste, um script síncrono — o job fica em fila e é o chamador que tem de conduzir `_run_job`. É por isso que `POST /api/generate` é `async def`: a rota tem de correr no loop, senão o `create_task` não tem onde aterrar e o job ficava para sempre em fila.
 
@@ -196,17 +197,19 @@ GENERATION_PARAM_FIELDS: frozenset[str] = frozenset(
 
 `_generation_params` (`backend/app.py:794`) deixa passar só essas chaves. O motivo está no docstring: `submit_job` faz `GenerationRequest(**params)`, portanto uma chave estranha de um cliente mais antigo ou escrito à mão voltaria como `TypeError`. Filtrar aqui é a diferença entre um `202` e um `400` para um cliente que não controlamos. Verificado: `{"topic": "...", "bogus_key": "x", "mood": "dark"}` devolve `202`.
 
-### 4.4 O estado nunca é `running`
+### 4.4 O estado `running` é real
 
-Este é o detalhe que mais surpreende quem lê o código à primeira.
+`Job.status` só toma os valores `queued`, `running`, `completed`, `failed` e `cancelled`, e a máquina de estados é monotónica: `queued -> running -> completed | failed`, mais a saída `queued -> cancelled`.
 
-`Job.status` só toma os valores `queued`, `completed`, `failed` e `cancelled`. **`_stage` não toca em `status`**, e `_run_job` também não: só o `_fail` e o fim de `run_generation` o escrevem. O conjunto `_running_ids` existe (`generator.py:292`), mas `cancel_job` não o consulta.
+**`_stage` nunca mexe em `status`** (`generator.py:550`): só em `stage`, `progress` e `message`. Quem escreve o estado é o *worker*, nas duas linhas a seguir a obter uma das *slots* do semáforo — `_running_ids.add(job_id)` e `job.status = "running"` (`generator.py:492-493`) — com a primeira marca de etapa logo a seguir (`generator.py:494`). Um job à espera de *slot* fica `queued`, com `progress: 0.0` e a mensagem de fila; por isso quem lê o snapshot distingue «à espera» de «a trabalhar» pelo `status`, sem adivinhar pelo `stage`.
 
-Consequência, verificada em execução: a meio de um job, o snapshot diz `status: "queued"` com `stage: "voice"` e `progress: 0.2`. Como `cancel_job` (`generator.py:381`) só recusa quando o estado não é `queued`, ele **aceita cancelar um job que já está a renderizar** e devolve `cancelled` verdadeiro. O trabalho não é interrompido — o render continua até ao fim — e o estado final é uma corrida entre a conclusão e o cancelamento. Se a etapa lançar depois do cancelamento, o bloco *worker* escreve `failed` (`generator.py:512`), o que pode substituir um `cancelled` por um `failed`.
+É isso que dá a `cancel_job` (`generator.py:381`) uma garantia real. Ele recusa tudo o que não esteja `queued` (`generator.py:393-394`), portanto um job `running` devolve `False` e o `DELETE` responde `{"cancelled": false}`. Verificado em execução: com três jobs submetidos, dois passam a `running` e o terceiro fica `queued`; cancelar o terceiro dá `cancelled`, cancelar um dos dois não muda nada, e os dois completam. Não é uma falha do servidor — não existe interruptor partilhado, e interromper o HyperFrames a meio deixaria um MP4 truncado em `storage/outputs/`.
 
-O mesmo estado afecta o painel: `frontend/js/generator.js:39` trata `queued` como «inactivo» antes de olhar para a etapa, por isso as etapas mostram-se inactivas durante o trabalho.
+O conjunto `_running_ids` (`generator.py:292`) serve ao *worker* para saber o que está dentro do semáforo; o `cancel_job` não o consulta. Decide pelo `status`, que é a mesma informação já publicada no snapshot.
 
-Isto está listado como limitação em [README.md](../README.md#limitações-conhecidas), não escondido aqui.
+O painel reproduz a mesma distinção: `frontend/js/generator.js:39` mapeia `queued` para «inactivo» antes de olhar para a etapa, enquanto `running` mapeia para a etapa real do pipeline (`frontend/js/generator.js:40-47`), com o rótulo de estado «A trabalhar».
+
+A falta de interruptor partilhado está listada como limitação em [README.md](../README.md#limitações-conhecidas), não escondido aqui.
 
 ### 4.5 Poda e histórico
 
@@ -216,27 +219,27 @@ Isto está listado como limitação em [README.md](../README.md#limitações-con
 
 ## 5. O caminho do render
 
-`render_engine.render_video_hyperframes` (`render_engine.py:995`) é o ponto de entrada. É `async` e devolve sempre um *dict*: `status: "rendered"` ou `status: "error"` com a mensagem. **Não levanta** quando o render falha — o que obriga o pipeline a verificar `status` explicitamente.
+`render_engine.render_video_hyperframes` (`render_engine.py:1236`) é o ponto de entrada. É `async` e devolve sempre um *dict*: `status: "rendered"` ou `status: "error"` com a mensagem. **Não levanta** quando o render falha — o que obriga o pipeline a verificar `status` explicitamente.
 
 ### 5.1 As sete etapas
 
-1. **Resolver o storyboard.** Se não vier nenhum, `parse_srt_to_segments` e `build_storyboard_from_segments` tratam disso (`render_engine.py:1027`). Se mesmo assim ficar vazio, há uma cena de recurso, para que o HyperFrames tenha alguma coisa para renderizar.
+1. **Resolver o storyboard.** Se não vier nenhum, `parse_srt_to_segments` e `build_storyboard_from_segments` tratam disso (`render_engine.py:1274`). Se mesmo assim ficar vazio, há uma cena de recurso, para que o HyperFrames tenha alguma coisa para renderizar.
 2. **Ajustar à duração do áudio.** Com `audio_duration` conhecida, `pipeline.fit_storyboard_to_duration` (`pipeline.py:719`) redistribui as cenas para o áudio, e não o contrário.
-3. **Preparar o directório.** `create_project_dir` (`render_engine.py:640`) cria `storage/outputs/.hf_<nome>/`, **apaga-o primeiro** para que assets de uma execução anterior nunca vazeiem, e escreve `hyperframes.json` e `package.json` com o *script* de render já fixado à versão.
-4. **Copiar os assets.** `stage_project_assets` (`render_engine.py:345`) copia media e áudio para `<project_dir>/assets/` e devolve referências relativas. É obrigatório: o HyperFrames recusa recursos locais fora do directório do projecto. Testa cada imagem com `looks_padded` (`render_engine.py:415`) e recolhe as rejeitadas.
-5. **Gerar o HTML.** `generate_composition_html` (`render_engine.py:458`) emite a composição com `build_subtitle_css` (`render_engine.py:168`) a aplicar o `SubtitleStyle` resolvido por `style.resolve_preset_and_style` (`style.py:611`). As animações por cena estão em `_scene_media_animations` (`render_engine.py:266`).
-6. **Renderizar.** `render_with_hyperframes` (`render_engine.py:696`) corre `npx --yes hyperframes@0.8.92 render` com uma lista de argumentos — nunca uma *shell string*. Se o `npx` não existir, traduz para `RuntimeError("npx not found...")`.
-7. **Misturar a música.** `_apply_background_music` (`render_engine.py:925`) só corre **depois** de um render bem-sucedido, porque o HyperFrames já meteu a narração no MP4. `mix_audio_track` (`render_engine.py:831`) volta a correr o `ffmpeg` sobre o ficheiro acabado e substitui-o atomicamente.
+3. **Preparar o directório.** `create_project_dir` (`render_engine.py:665`) cria `storage/outputs/.hf_<nome>/`, **apaga-o primeiro** para que assets de uma execução anterior nunca vazeiem, e escreve `hyperframes.json` e `package.json` com o *script* de render já fixado à versão.
+4. **Copiar os assets.** `stage_project_assets` (`render_engine.py:370`) copia media e áudio para `<project_dir>/assets/` e devolve referências relativas. É obrigatório: o HyperFrames recusa recursos locais fora do directório do projecto. Testa cada imagem com `looks_padded` (`render_engine.py:411`) e recolhe as rejeitadas.
+5. **Gerar o HTML.** `generate_composition_html` (`render_engine.py:483`) emite a composição com `build_subtitle_css` (`render_engine.py:183`) a aplicar o `SubtitleStyle` resolvido por `style.resolve_preset_and_style` (`style.py:611`). As animações por cena estão em `_scene_media_animations` (`render_engine.py:281`).
+6. **Renderizar.** `render_with_hyperframes` (`render_engine.py:892`) corre `npx --yes hyperframes@0.8.92 render` com uma lista de argumentos — nunca uma *shell string*. A espera por esse processo é limitada pelo watchdog de [5.4](#54-o-watchdog-do-render). Se o `npx` não existir, traduz para `RuntimeError("npx not found...")`.
+7. **Misturar a música.** `_apply_background_music` (`render_engine.py:1166`) só corre **depois** de um render bem-sucedido, porque o HyperFrames já meteu a narração no MP4. `mix_audio_track` (`render_engine.py:1072`) volta a correr o `ffmpeg` sobre o ficheiro acabado e substitui-o atomicamente.
 
-`cleanup_render_dirs` (`render_engine.py:677`) remove os `.hf_*` das execuções anteriores, mantendo o que acabou de ser usado — útil para inspeccionar a composição.
+`cleanup_render_dirs` (`render_engine.py:702`) remove os `.hf_*` das execuções anteriores, mantendo o que acabou de ser usado — útil para inspeccionar a composição.
 
 ### 5.2 A mistura de áudio
 
 O grafo de filtro é escolhido por três funções, todas em `render_engine.py`:
 
-- `_ducked_mix_filter` (`render_engine.py:784`) — voz e cama musical, com a música a ser comprimida por *sidechain* a partir da própria voz. A voz é partida com `asplit` porque é simultaneamente entrada da mistura e chave do *sidechain*.
-- `_flat_mix_filter` (`render_engine.py:805`) — as duas entradas somadas nos seus próprios níveis, sem *ducking*. Aqui a voz **não** é partida: uma segunda saída `asplit` por consumir faz o `ffmpeg` abortar.
-- `_music_only_filter` (`render_engine.py:825`) — só quando `_has_audio_stream` (`render_engine.py:736`) confirma que o vídeo não tem áudio.
+- `_ducked_mix_filter` (`render_engine.py:1025`) — voz e cama musical, com a música a ser comprimida por *sidechain* a partir da própria voz. A voz é partida com `asplit` porque é simultaneamente entrada da mistura e chave do *sidechain*.
+- `_flat_mix_filter` (`render_engine.py:1046`) — as duas entradas somadas nos seus próprios níveis, sem *ducking*. Aqui a voz **não** é partida: uma segunda saída `asplit` por consumir faz o `ffmpeg` abortar.
+- `_music_only_filter` (`render_engine.py:1066`) — só quando `_has_audio_stream` (`render_engine.py:977`) confirma que o vídeo não tem áudio.
 
 `_has_audio_stream` distingue três casos, não dois: `True`, `False` e `None`. `None` significa que o `ffprobe` não conseguiu responder, e isso **não** pode ser confundido com «o vídeo não tem áudio» — o autor do código comenta-o explicitamente.
 
@@ -244,11 +247,21 @@ Os objectivos de nível são centralizados: voz a −6 dBFS, música a −18 dBF
 
 ### 5.3 O motor de render
 
-`HYPERFRAMES_CLI` (`render_engine.py:38`) é `npx.cmd` no Windows e `npx` nos restantes, e `HYPERFRAMES_VERSION` (`render_engine.py:39`) está fixo em `0.8.92`. A versão aparece em três sítios — o comando, o `scripts.render` e o `scripts.check` do `package.json` — e é a mesma constante nos três.
+`HYPERFRAMES_CLI` (`render_engine.py:53`) é `npx.cmd` no Windows e `npx` nos restantes, e `HYPERFRAMES_VERSION` (`render_engine.py:54`) está fixo em `0.8.92`. A versão aparece em três sítios — o comando, o `scripts.render` e o `scripts.check` do `package.json` — e é a mesma constante nos três.
 
-As dimensões vêm de `get_dimensions` (`render_engine.py:218`): `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080, com `vertical` como recurso para qualquer valor desconhecido.
+As dimensões vêm de `get_dimensions` (`render_engine.py:233`): `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080, com `vertical` como recurso para qualquer valor desconhecido.
 
-O `_grain_overlay` (`render_engine.py:237`) e a `_progress_bar` (`render_engine.py:256`) usam **passos absolutos em tempos absolutos**, não `infinite`. É uma decisão deliberada: um efeito `infinite` daria um resultado diferente em cada frame, e o render tem de ser reprodutível.
+O `_grain_overlay` (`render_engine.py:252`) e a `_progress_bar` (`render_engine.py:271`) usam **passos absolutos em tempos absolutos**, não `infinite`. É uma decisão deliberada: um efeito `infinite` daria um resultado diferente em cada frame, e o render tem de ser reprodutível.
+
+### 5.4 O watchdog do render
+
+O `npx hyperframes` é o passo lento e o único sem limite natural, por isso a espera por ele é limitada. `render_timeout_seconds` (`render_engine.py:726`) lê `DARK_STUDIO_RENDER_TIMEOUT` do ambiente a cada chamada (`render_engine.py:914`), nunca à importação: assim um teste pode encolher o prazo e um operador pode aumentá-lo sem reiniciar o servidor. Um valor em falta, vazio, não numérico ou não positivo cai no `DEFAULT_RENDER_TIMEOUT = 900.0` (`render_engine.py:356`).
+
+O default veio de uma medição, não de um palpite: ~316 s para um corte de 41 s a 1080x1920 (1237 frames a ~3,9 fps) numa máquina de 2 vCPU. 900 s são cerca de três vezes isso, pelo que o watchdog só apanha um Chrome ou um `ffmpeg` encravado — nunca um render válido mas lento.
+
+Quando o prazo estourar, `_kill_process_tree` (`render_engine.py:874`) derruba a **árvore toda**, não o filho directo: `os.killpg` com SIGTERM e depois SIGKILL no POSIX (`render_engine.py:798`), `taskkill /T /F` no Windows (`render_engine.py:823`). O `npx` deixa o Chrome e o `ffmpeg` a escrever num ficheiro que já ninguém espera, por que razão o filho é lançado em sessão própria (`render_engine.py:926`) e ficar só por ele deixaria processos órfãos. O `CancelledError` — que deriva de `BaseException` e por isso nunca chega ao `except Exception` do chamador — mata a árvore e volta a levantar (`render_engine.py:953`).
+
+Para quem chama, o efeito é o de uma falha normal. `render_video_hyperframes` apanha a excepção e devolve `status: "error"` com a mensagem portuguesa «tempo limite de render excedido (900s). O render foi encerrado; reduza a duracao do video ou aumente DARK_STUDIO_RENDER_TIMEOUT.» (`render_engine.py:948`), o ficheiro parcial é apagado (`render_engine.py:947`) — um MP4 truncado que parece entregável é pior do que nenhum ficheiro — e o job do orquestrador acaba `failed` pelo caminho normal de etapa. **Nunca** é devolvido como `status: "rendered"`.
 
 ---
 
@@ -335,7 +348,7 @@ storage/
 
 Três decisões merecem explicação:
 
-**O directório do HyperFrames vive em `outputs/`, não num temporário.** O comentário em `create_project_dir` (`render_engine.py:643`) diz porquê: um temporário convida o Chrome/Puppeteer a competir com a limpeza.
+**O directório do HyperFrames vive em `outputs/`, não num temporário.** O comentário em `create_project_dir` (`render_engine.py:668`) diz porquê: um temporário convida o Chrome/Puppeteer a competir com a limpeza.
 
 **Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`). Mesmo quando a transcrição degradou, existe um SRT — o que é pior, num sentido: o pipeline nunca pára, apenas passa a fabricar conteúdo.
 

@@ -38,7 +38,7 @@ Em Linux e macOS, `sh start.sh` faz exactamente o mesmo, com a mesma sonda de po
 
 ## O fluxo de um clique
 
-`POST /api/generate` (em [`docs/API.md`](docs/API.md#post-apigenerate)) arranca o tema inteiro e devolve `202` com um `job_id`. O orquestrador é `backend/services/generator.py` (712 linhas), que conduz quatro etapas e grava o progresso em marcos públicos:
+`POST /api/generate` (em [`docs/API.md`](docs/API.md#10-post-apigenerate)) arranca o tema inteiro e devolve `202` com um `job_id`. O orquestrador é `backend/services/generator.py` (715 linhas), que conduz quatro etapas e grava o progresso em marcos públicos:
 
 | Etapa | Progresso | O que acontece |
 | --- | --- | --- |
@@ -54,7 +54,7 @@ No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `gene
 
 ### Dois avisos honestos sobre este fluxo
 
-- **Acompanhar um job pela WebUI é lento por desenho.** O painel faz *poll* a `GET /api/jobs/{job_id}` de 1,5 em 1,5 segundos (`frontend/js/generator.js:236`). Para scripting, use a API directamente — o histórico completo está em `GET /api/jobs`, que devolve um **array simples**, não um objecto com envelope:
+- **Acompanhar um job pela WebUI é lento por desenho.** O painel faz *poll* a `GET /api/jobs/{job_id}` de 1,5 em 1,5 segundos (`frontend/js/generator.js:244`). Para scripting, use a API directamente — o histórico completo está em `GET /api/jobs`, que devolve um **array simples**, não um objecto com envelope:
 
   ```bash
   curl -s -X POST http://127.0.0.1:8013/api/generate \
@@ -63,9 +63,9 @@ No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `gene
   curl -s http://127.0.0.1:8013/api/jobs/<job_id>
   ```
 
-- **`DELETE /api/jobs/{job_id}` não é um cancelamento fiável.** Ver [Limitações conhecidas](#limitações-conhecidas), ponto 1.
+- **`DELETE /api/jobs/{job_id}` só cancela o que ainda está em fila.** Um job `queued` passa a `cancelled`; um job `running` devolve `{"cancelled": false}` e deixa o render acabar. Ver [Limitações conhecidas](#limitações-conhecidas), ponto 11.
 
-O fluxo manual — guião → voz → legendas → composição → render — funciona todo, e é o caminho que a WebUI usa por baixo. Ver [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#o-pipeline-etapa-a-etapa).
+O fluxo manual — guião → voz → legendas → composição → render — funciona todo, e é o caminho que a WebUI usa por baixo. Ver [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#3-o-pipeline-etapa-a-etapa).
 
 ---
 
@@ -88,15 +88,15 @@ Cada linha aponta para o ficheiro e o símbolo que a implementam.
 - **Cache de media por URL** — `pipeline.download_media_asset` (`pipeline.py:668`) guarda em `storage/media/<projeto>/`, com o hash do URL no nome do ficheiro.
 
 **Vídeo**
-- **Render HyperFrames via `npx`** — `render_engine.render_with_hyperframes` (`render_engine.py:696`) corre `npx --yes hyperframes@0.8.92 render`, que lança Chrome headless.
-- **Composição HTML com GSAP** — `render_engine.generate_composition_html` (`render_engine.py:458`) emite uma timeline por cena: fade, wipe de entrada, Ken Burns e desfoque com recuo do lado que sai.
-- **Grain e barra de progresso** — `_grain_overlay` (`render_engine.py:237`) e `_progress_bar` (`render_engine.py:256`) usam passos absolutos em tempos absolutos, não `infinite`, por isso o resultado é idêntico em qualquer frame.
+- **Render HyperFrames via `npx`** — `render_engine.render_with_hyperframes` (`render_engine.py:892`) corre `npx --yes hyperframes@0.8.92 render`, que lança Chrome headless.
+- **Composição HTML com GSAP** — `render_engine.generate_composition_html` (`render_engine.py:483`) emite uma timeline por cena: fade, wipe de entrada, Ken Burns e desfoque com recuo do lado que sai.
+- **Grain e barra de progresso** — `_grain_overlay` (`render_engine.py:252`) e `_progress_bar` (`render_engine.py:271`) usam passos absolutos em tempos absolutos, não `infinite`, por isso o resultado é idêntico em qualquer frame.
 - **Storyboard com sobreposição de 0,7 s** — `pipeline.normalize_scene_timings` (`pipeline.py:319`) faz cada cena começar antes do seu tempo de origem, para o wipe ter o que revelar; os fins ficam na timeline de origem, para a narração ficar sincronizada.
-- **Assets copiados para dentro da composição** — `render_engine.stage_project_assets` (`render_engine.py:345`) copia tudo para `storage/outputs/.hf_<nome>/assets/`, porque o HyperFrames recusa recursos locais fora do directório do projecto.
+- **Assets copiados para dentro da composição** — `render_engine.stage_project_assets` (`render_engine.py:370`) copia tudo para `storage/outputs/.hf_<nome>/assets/`, porque o HyperFrames recusa recursos locais fora do directório do projecto.
 - **Cortes ao ritmo (beat-sync), loop contínuo, thumbnail e metadados de plataforma** — `viral_pipeline.detect_beats` (`viral_pipeline.py:40`), `make_seamless_loop` (`viral_pipeline.py:148`), `generate_optimized_thumbnail` (`viral_pipeline.py:174`) e `build_platform_metadata` (`viral_pipeline.py:221`). Exposto em `POST /api/build-viral`.
-- **Formatos** — `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080 (`render_engine.get_dimensions`, `render_engine.py:218`).
+- **Formatos** — `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080 (`render_engine.get_dimensions`, `render_engine.py:233`).
 - **Streaming dos MP4** — `GET /api/project/{nome}/video` e `GET /api/project/{nome}/shorts/video` devolvem `video/mp4` directamente, com `404` (e não JSON) para que um `<video>` possa falhar de forma visível.
-- **Música de fundo misturada depois do render** — `render_engine.mix_audio_track` (`render_engine.py:831`) volta a correr `ffmpeg` sobre o MP4 já produzido. Nunca é fatal: uma faixa em falta ou um `ffmpeg` em falta saem em `music.applied` falso, com uma nota a explicar porquê.
+- **Música de fundo misturada depois do render** — `render_engine.mix_audio_track` (`render_engine.py:1072`) volta a correr `ffmpeg` sobre o MP4 já produzido. Nunca é fatal: uma faixa em falta ou um `ffmpeg` em falta saem em `music.applied` falso, com uma nota a explicar porquê.
 
 **Confiança e operação**
 - **Contrato `AUTH_*` uniforme** — `auth_contract.AuthError` (`auth_contract.py:14`) transporta `error_code`, `message`, `details` e `status_code`; o handler instalado em `backend/app.py:81-84` devolve-o tal e qual. São **seis** códigos, definidos em `auth_contract.py:6-11`.
@@ -173,22 +173,21 @@ O que **não** funciona, ou funciona pior do que parece:
 
 ### Limitações conhecidas
 
-1. **`cancel_job` não protege os jobs a correr.** A função (`generator.py:381`) só recusa quando o estado não é `queued` — mas o estado **nunca** passa a `running`: um job a renderizar continua com `status` igual a `queued` (verificado em execução). `DELETE /api/jobs/{id}` devolve portanto `cancelled` verdadeiro para um job já em curso. O trabalho **não** é interrompido — o render continua até ao fim, e o estado final é uma corrida entre a conclusão e o cancelamento. Pior: o bloco *worker* escreve `failed` se a etapa lançar depois do cancelamento (`generator.py:512`), o que pode substituir um `cancelled` por um `failed`.
-2. **`GET /api/jobs` devolve um array simples, não um envelope.** É a única rota que responde com `[...]` em vez de `{...}`. Um cliente que leia `resposta.jobs` obtém `undefined` em silêncio. O próprio frontend tem de se guardingar disso (`frontend/js/views/projects.js:155`). Escreva `for (const job of await r.json())`.
-3. **A transcrição degrada em silêncio.** Sem `faster-whisper`, ou quando o modelo não devolve segmentos, `pipeline.transcribe_audio_file` (`pipeline.py:64`) engole a excepção e devolve **cinco frases fixas em português**, cada uma de 3 segundos (`pipeline.py:84-94`). A resposta HTTP é `200` e não há campo de aviso. Um `.srt` inventado é exactamente o que `/api/tts` e `/api/build-video` vão consumir a seguir. Verificado: um MP3 de 3 bytes produz `200` com o SRT de recurso.
-4. **A quota diária dos modelos `:free` degrada para recurso local, sem falhar.** `_unavailable_reason` (`script_gen.py:146`) salta o pedido e `generate_script` devolve o guião de recurso com `source: "fallback-local"` e `fallback_error`. O `POST /api/script` marca `degraded` verdadeiro, mas **devolve `200`** — se ninguém ler o campo, a degradação é invisível. Para a tornar visível: `GET /api/providers` devolve `openrouter.quota_exhausted`.
-5. **Não existe autenticação em lado nenhum.** Não há login, não há palavra-passe, não há token. O `AuthHandler` do frontend trata de *chaves de fornecedores de terceiros*, não de acesso à aplicação. O backend escuta em `127.0.0.1` e a WebUI é uma app local de utilizador único. **Não exponha esta porta a uma rede.**
-6. **As preferências vivem só no `localStorage`.** `state.js` persiste `project`, `voice`, `style`, `music` e `preset` na chave `darkstudio.prefs.v1` (`frontend/js/state.js:9`, `frontend/js/state.js:75`). Não há armazenamento de projectos no servidor: `GET /api/projects` (`backend/app.py:1013`) lista **ficheiros** de `storage/uploads/`, não projectos; é o frontend que os agrupa por nome em `frontend/js/projects.js:13`.
-7. **As caches são por processo.** O cache de media (`pipeline._MEDIA_CACHE`, `pipeline.py:444`), o de quota (`provider_registry._OPENROUTER_QUOTA`, `provider_registry.py:669`) e o de qualidade de assets (`asset_quality._VERDICT_CACHE`, `asset_quality.py:67`) são dicionários ao nível do módulo. Com mais do que um processo de servidor, não são partilhados.
-8. **`pytest.ini` não desmarca os testes `live`.** O ficheiro declara o marcador `live` e diz como o desmarcar (`pytest.ini:7`), mas não tem `addopts`. Um `pytest` sem `-m "not live"` chama a OpenRouter e a Pexels a sério e gasta quota. Use sempre `pytest -m "not live"`.
-9. **O override de GPU não acelera o render.** `docker-compose.gpu.yml` só dá CUDA ao `faster-whisper`. O Chrome corre com `--disable-gpu` e o encoder de saída é o `ffmpeg`, não o Chrome — está escrito no próprio ficheiro (`docker-compose.gpu.yml:14`). Para renders mais rápidos: mais CPU e mais RAM.
-10. **Dois testes de ponta a ponta expiram aos 120 s.** `tests/test_e2e.py:209` e `tests/test_e2e.py:217` fazem `POST /api/build-video` com `timeout=120`. Numa máquina mais lenta, um render completo pode não caber.
-11. **O `requirements.txt` afirma algo que o código já não faz.** As linhas 18-22 dizem que `backend/app.py` importa `viral_pipeline` no topo e que «sem estes pacotes o servidor NAO arranca de todo». Isso foi verdade e deixou de ser: o import é **preguiçoso**, dentro de `build_viral` (`backend/app.py:745`), precisamente para o servidor não depender do `librosa`. O `scripts/check_env.py:48` ainda marca o `librosa` como obrigatório — mantive-o, porque `/api/build-viral` devolve `503` sem ele —, mas o motivo está errado.
-12. **O render não é cancelável.** Como não existe interruptor partilhado, um HyperFrames a meio fica a correr até ao fim. Daí `cancel_job` só mexer no registo.
+1. **`GET /api/jobs` devolve um array simples, não um envelope.** É a única rota que responde com `[...]` em vez de `{...}`. Um cliente que leia `resposta.jobs` obtém `undefined` em silêncio. O próprio frontend tem de se guardingar disso (`frontend/js/views/projects.js:155`). Escreva `for (const job of await r.json())`.
+2. **A transcrição degrada em silêncio.** Sem `faster-whisper`, ou quando o modelo não devolve segmentos, `pipeline.transcribe_audio_file` (`pipeline.py:64`) engole a excepção e devolve **cinco frases fixas em português**, cada uma de 3 segundos (`pipeline.py:84-94`). A resposta HTTP é `200` e não há campo de aviso. Um `.srt` inventado é exactamente o que `/api/tts` e `/api/build-video` vão consumir a seguir. Verificado: um MP3 de 3 bytes produz `200` com o SRT de recurso.
+3. **A quota diária dos modelos `:free` degrada para recurso local, sem falhar.** `_unavailable_reason` (`script_gen.py:146`) salta o pedido e `generate_script` devolve o guião de recurso com `source: "fallback-local"` e `fallback_error`. O `POST /api/script` marca `degraded` verdadeiro, mas **devolve `200`** — se ninguém ler o campo, a degradação é invisível. Para a tornar visível: `GET /api/providers` devolve `openrouter.quota_exhausted`.
+4. **Não existe autenticação em lado nenhum.** Não há login, não há palavra-passe, não há token. O `AuthHandler` do frontend trata de *chaves de fornecedores de terceiros*, não de acesso à aplicação. O backend escuta em `127.0.0.1` e a WebUI é uma app local de utilizador único. **Não exponha esta porta a uma rede.**
+5. **As preferências vivem só no `localStorage`.** `state.js` persiste `project`, `voice`, `style`, `music` e `preset` na chave `darkstudio.prefs.v1` (`frontend/js/state.js:9`, `frontend/js/state.js:75`). Não há armazenamento de projectos no servidor: `GET /api/projects` (`backend/app.py:1013`) lista **ficheiros** de `storage/uploads/`, não projectos; é o frontend que os agrupa por nome em `frontend/js/projects.js:13`.
+6. **As caches são por processo.** O cache de media (`pipeline._MEDIA_CACHE`, `pipeline.py:444`), o de quota (`provider_registry._OPENROUTER_QUOTA`, `provider_registry.py:669`) e o de qualidade de assets (`asset_quality._VERDICT_CACHE`, `asset_quality.py:67`) são dicionários ao nível do módulo. Com mais do que um processo de servidor, não são partilhados.
+7. **Os testes `live` só gastam quota quando se pedem.** O `pytest.ini` já traz `addopts = -m "not live"` (`pytest.ini:21`), por isso um `pytest` a seco não chama a OpenRouter nem a Pexels. Os 9 testes de `tests/test_live_providers.py` só entram com `pytest -m live` (`pytest.ini:24`), e nesse caso batem a sério na rede e gastam quota real.
+8. **O override de GPU não acelera o render.** `docker-compose.gpu.yml` só dá CUDA ao `faster-whisper`. O Chrome corre com `--disable-gpu` e o encoder de saída é o `ffmpeg`, não o Chrome — está escrito no próprio ficheiro (`docker-compose.gpu.yml:14`). Para renders mais rápidos: mais CPU e mais RAM.
+9. **Dois testes de ponta a ponta expiram aos 900 s.** `tests/test_e2e.py:213` e `tests/test_e2e.py:221` fazem `POST /api/build-video` com `BUILD_VIDEO_TIMEOUT = 900` (`tests/test_e2e.py:25`). Numa máquina mais lenta, um render completo pode não caber.
+10. **O `requirements.txt` afirma algo que o código já não faz.** As linhas 18-22 dizem que `backend/app.py` importa `viral_pipeline` no topo e que «sem estes pacotes o servidor NAO arranca de todo». Isso foi verdade e deixou de ser: o import é **preguiçoso**, dentro de `build_viral` (`backend/app.py:745`), precisamente para o servidor não depender do `librosa`. O `scripts/check_env.py:48` ainda marca o `librosa` como obrigatório — mantive-o, porque `/api/build-viral` devolve `503` sem ele —, mas o motivo está errado.
+11. **O render não é cancelável.** Não existe interruptor partilhado, portanto um job `running` não pára a meio: `cancel_job` recusa-o e o HyperFrames acaba até ao fim. O que impede um render infinito é o *watchdog* — `DARK_STUDIO_RENDER_TIMEOUT`, 900 s por omissão, lido a cada chamada — que mata a árvore de processos e devolve o job como `failed`, com mensagem em português, em vez de um MP4 truncado. Ver [docs/INSTALL.md](docs/INSTALL.md#15-ficheiro-env).
 
 ### O que não foi medido
 
-Não corri a suite de testes nem um render completo neste ambiente: não há rede para o Edge TTS nem cabeçalhos de quota do OpenRouter. O que *foi* verificado em execução: a lista completa de rotas (`app.routes`), as respostas e os códigos de estado de todos os caminhos de erro documentados, os catálogos (53 vozes, 8 presets, 6 faixas, 6 ambientes), o `404` em `/`, o `200` em `/app/`, a forma do corpo `AUTH_*`, o ciclo de vida de um job e o `cancel_job` a meio. As contagens de linhas são de `wc -l`.
+Não corri a suite de testes nem um render completo neste ambiente: não há rede para o Edge TTS nem cabeçalhos de quota do OpenRouter. O que *foi* verificado em execução: a lista completa de rotas (`app.routes`), as respostas e os códigos de estado de todos os caminhos de erro documentados, os catálogos (53 vozes, 8 presets, 6 faixas, 6 ambientes), o `404` em `/`, o `200` em `/app/`, a forma do corpo `AUTH_*`, o ciclo de vida de um job (`queued` -> `running` -> `completed`, com um terceiro a ficar `queued` à espera de *slot*) e o `cancel_job` a meio, que aceita um `queued` e recusa um `running`. As contagens de linhas são de `wc -l`.
 
 ---
 
@@ -196,11 +195,13 @@ Não corri a suite de testes nem um render completo neste ambiente: não há red
 
 ```bash
 python -m pip install -r requirements.txt     # inclui pytest, pytest-asyncio e requests
-pytest -m "not live"                          # obrigatório: ver limitação 8
-pytest -m "not live and not slow"              # salta também os renders completos
+pytest                                          # o pytest.ini já desmarca os testes live
+pytest -m "not live"                            # a forma explícita do mesmo
+pytest -m "not live and not slow"               # salta também os renders completos
+pytest -m live                                  # os 9 testes live: rede real, quota real
 ```
 
-`pytest.ini` define `asyncio_mode = auto` e `testpaths = tests`. Os marcadores disponíveis são `slow` e `live`.
+`pytest.ini` define `asyncio_mode = auto`, `testpaths = tests` e `addopts = -m "not live"`. Os marcadores disponíveis são `slow` e `live`; os 9 testes `live` de `tests/test_live_providers.py` só entram com `pytest -m live`.
 
 ---
 

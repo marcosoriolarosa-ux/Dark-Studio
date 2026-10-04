@@ -47,7 +47,7 @@ Sem eles o servidor arranca e a geração de vídeo falha a meio: `asset_quality
 
 ### 1.3 Node.js LTS
 
-O render não é Python: o motor chama `npx --yes hyperframes@0.8.92 render` (`render_engine.py:696`), que por sua vez lança Chrome headless. Sem `node`/`npx` não há vídeo.
+O render não é Python: o motor chama `npx --yes hyperframes@0.8.92 render` (`render_engine.py:892`), que por sua vez lança Chrome headless. Sem `node`/`npx` não há vídeo.
 
 Instale o **LTS** em <https://nodejs.org/en/download>. O Debian 12 traz Node 18, que já está em fim de vida; a imagem Docker usa explicitamente o 22.14.0 (`Dockerfile:23`).
 
@@ -101,6 +101,9 @@ Todas as chaves disponíveis, com o que cada uma liga:
 | `DARK_STUDIO_PORT_MAX` | limite superior da busca de porta | porta base + 20 |
 | `DARK_STUDIO_ALLOWED_ORIGINS` | origens CORS | `http://127.0.0.1:8013` e `http://localhost:8013` |
 | `DARK_STUDIO_NO_BROWSER` | `1` impede a abertura do navegador | abre |
+| `DARK_STUDIO_RENDER_TIMEOUT` | segundos que um render pode correr antes de ser morto | 900 |
+
+O `DARK_STUDIO_RENDER_TIMEOUT` é lido do ambiente a cada render (`render_engine.py:726`), não uma vez no arranque: um valor em falta, vazio, não numérico ou não positivo vale 900. Passado o prazo, o render é morto como uma árvore de processos — `os.killpg` no POSIX, `taskkill /T /F` no Windows (`render_engine.py:823`) — e o resultado sai como uma falha comum, com mensagem em português, nunca como um MP4 truncado. Ver [O watchdog do render](ARCHITECTURE.md#54-o-watchdog-do-render).
 
 O ficheiro é lido como UTF-8 e as chaves não devem ter acentos. **Nunca** coloque uma chave real no `.env.example`. O `.env` está no `.gitignore`, e a aplicação também o escreve sozinha quando usa `POST /api/settings`.
 
@@ -292,11 +295,11 @@ pytest -m "not live"
 pytest -m "not live and not slow"              # salta os renders completos
 ```
 
-> **`-m "not live"` não é opcional.** O `pytest.ini` declara o marcador `live` e diz como o desmarcar (`pytest.ini:7`), mas **não tem `addopts`**. Um `pytest` sem `-m` chama a OpenRouter e a Pexels a sério e gasta quota real. Isto vale a pena porque o cabeçalho de `tests/test_live_providers.py` afirma que os testes estão «Deselected by default» — não estão. Corrigir isto é uma linha: `addopts = -m "not live"` no `pytest.ini`.
+> **Os testes `live` estão desligados por omissão.** O `pytest.ini` traz `addopts = -m "not live"` (`pytest.ini:21`) e declara o marcador `live` logo a seguir (`pytest.ini:24`), por isso um `pytest` a seco não chama a OpenRouter, a Pexels nem a Pixabay. Para os correr, peça-os à mão com `pytest -m live` — e saiba que esse caminho bate mesmo na rede e gasta quota real. As formas explícitas da tabela acima continuam válidas: o `-m` da linha de comandos vem depois do `addopts`, e é o último a valer.
 
 Os marcadores disponíveis são `slow` e `live`. Os 16 ficheiros de `tests/` são executados com `asyncio_mode = auto`, sem configuração adicional.
 
-Dois testes de ponta a ponta usam `timeout=120` num `POST /api/build-video` completo (`tests/test_e2e.py:209`, `tests/test_e2e.py:217`). Numa máquina mais lenta, um render não cabe em 120 s e o teste falha por tempo, não por defeito.
+Dois testes de ponta a ponta usam `BUILD_VIDEO_TIMEOUT = 900` (`tests/test_e2e.py:25`) num `POST /api/build-video` completo (`tests/test_e2e.py:213`, `tests/test_e2e.py:221`). Numa máquina mais lenta, um render não cabe em 900 s e o teste falha por tempo, não por defeito.
 
 ---
 
@@ -332,6 +335,10 @@ O `start.bat:66-69` testa o `.venv` antes de o usar, precisamente para não tran
 ### `npx not found. Please install Node.js and npm.`
 
 Falta o Node. Volte ao passo 1.3.
+
+### «tempo limite de render excedido»
+
+O render passou do prazo e foi morto. Num corte longo, ou numa máquina lenta, isso acontece: baixe o `duration_target` do pedido, reduza o `section_count`, ou aumente `DARK_STUDIO_RENDER_TIMEOUT` no `.env` (900 s por omissão). O ficheiro parcial é apagado de propósito — um MP4 truncado que pareça concluído é pior do que nenhum. Se o erro persistir com um vídeo curto, o Chrome ou o `ffmpeg` estão encravados; reinicie o servidor. E atenção: a vista «Definições» reescreve o `.env` com o seu conjunto fixo de nove chaves, por isso um valor posto à mão desapareceu assim que alguém gravou lá.
 
 ### A legenda não aparece no vídeo
 
