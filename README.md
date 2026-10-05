@@ -1,6 +1,6 @@
 # Dark Studio
 
-**PT.** O Dark Studio é uma mesa de montagem de vídeo narrado que corre inteiramente na sua máquina. Escreve um tema, o servidor trata do resto: gera o guião, sintetiza a voz, transcreve o áudio para legendas, pesquisa imagem de stock cena a cena e devolve um MP4 vertical com legendas queimadas, cortes e música de fundo. A interface é uma SPA servida pelo próprio backend em `/app/`; a IA é sempre um modelo **`:free`** do OpenRouter, e a inexistência de qualquer parâmetro que peça um modelo pago é uma invariante do projecto, não um acidente.
+**PT.** O Dark Studio é uma mesa de montagem de vídeo narrado que corre inteiramente na sua máquina. Escreve um tema, o servidor trata do resto: gera o guião, sintetiza a voz, tira as legendas desse mesmo guião, pesquisa imagem de stock cena a cena e devolve um MP4 vertical com legendas queimadas, cortes e música de fundo. A interface é uma SPA servida pelo próprio backend em `/app/`; a IA é sempre um modelo **`:free`** do OpenRouter, e a inexistência de qualquer parâmetro que peça um modelo pago é uma invariante do projecto, não um acidente.
 
 Documentação: **[Instalação](docs/INSTALL.md)** · **[Arquitectura](docs/ARCHITECTURE.md)** · **[API](docs/API.md)**
 
@@ -38,19 +38,19 @@ Em Linux e macOS, `sh start.sh` faz exactamente o mesmo, com a mesma sonda de po
 
 ## O fluxo de um clique
 
-`POST /api/generate` (em [`docs/API.md`](docs/API.md#10-post-apigenerate)) arranca o tema inteiro e devolve `202` com um `job_id`. O orquestrador é `backend/services/generator.py` (715 linhas), que conduz quatro etapas e grava o progresso em marcos públicos:
+`POST /api/generate` (em [`docs/API.md`](docs/API.md#10-post-apigenerate)) arranca o tema inteiro e devolve `202` com um `job_id`. O orquestrador é `backend/services/generator.py` (1185 linhas), que conduz quatro etapas e grava o progresso em marcos públicos:
 
 | Etapa | Progresso | O que acontece |
 | --- | --- | --- |
 | `script` | `0.05` | `script_gen.generate_script` — modelo `:free` ou guião local de recurso |
-| `voice` | `0.20` | `tts.synthesize_speech_long`, `pipeline.transcribe_audio_file` e escrita do SRT |
+| `voice` | `0.20` | `tts.synthesize_speech_long` e as legendas derivadas de `script.full_text` por `pipeline.build_srt_from_text` — sem transcrição |
 | `media` | `0.40` | `pipeline.search_media_for_scenes` — uma pesquisa por cena |
 | `render` | `0.60` | `render_engine.render_video_hyperframes` — HyperFrames via `npx` |
 | `done` | `1.00` | resultado anexado ao job; `status` passa a `completed` |
 
-Os valores vivem em constantes nomeadas (`generator.py:53-57`) porque são contrato público: quem os consulta não deve adivinhar.
+Os valores vivem em constantes nomeadas (`generator.py:78-82`) porque são contrato público: quem os consulta não deve adivinhar.
 
-No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `generator.py:45`); os restantes ficam em fila atrás de um semáforo. Qualquer falha de etapa é apanhada, registada como `status: "failed"` com mensagem em português, e a excepção é engolida — um job falhado nunca bloqueia a fila nem propaga para quem o chamou.
+No máximo **dois** jobs correm ao mesmo tempo (`MAX_CONCURRENT_JOBS = 2`, `generator.py:70`); os restantes ficam em fila atrás de um semáforo. Qualquer falha de etapa é apanhada, registada como `status: "failed"` com mensagem em português, e a excepção é engolida — um job falhado nunca bloqueia a fila nem propaga para quem o chamou.
 
 ### Dois avisos honestos sobre este fluxo
 
@@ -74,24 +74,24 @@ O fluxo manual — guião → voz → legendas → composição → render — f
 Cada linha aponta para o ficheiro e o símbolo que a implementam.
 
 **Conteúdo e texto**
-- **Transcrição de áudio para SRT** — `pipeline.transcribe_audio_file` (`pipeline.py:64`) usa `faster-whisper` (modelo `tiny`, CPU, `int8`) e escreve `storage/uploads/<projeto>.srt`; exposto em `POST /api/transcribe`.
+- **Transcrição de áudio para SRT** — `pipeline.transcribe_audio_file` (`pipeline.py:195`) usa `faster-whisper` (modelo `tiny`, CPU, `int8`) e escreve `storage/uploads/<projeto>.srt`; exposto em `POST /api/transcribe`, hoje o **único** caminho que precisa do pacote. Sem ele a função devolve um único segmento marcado como substituto, e se o modelo correr e falhar levanta `TranscriptionFailed` em vez de devolver frases inventadas. O fluxo de um clique não transcreve: deriva as legendas do guião com `pipeline.build_srt_from_text` (`pipeline.py:377`).
 - **Geração de guião** — `script_gen.generate_script` (`script_gen.py:480`) em cinco idiomas (`script_gen.LANGUAGES`, `script_gen.py:32`), com recurso local declarado em `source: "fallback-local"` mais `fallback_error` quando o modelo não está disponível.
-- **Extracção de termos de pesquisa** — `pipeline.extract_keywords_from_text` (`pipeline.py:176`) descarta a estrutura do SRT e as stopwords portuguesas, penaliza flexões vagas e intercala bigramas com palavras soltas.
+- **Extracção de termos de pesquisa** — `pipeline.extract_keywords_from_text` (`pipeline.py:540`) descarta a estrutura do SRT e as stopwords portuguesas, penaliza flexões vagas e intercala bigramas com palavras soltas.
 - **Destaques automáticos para shorts** — `shorts_pipeline.detect_highlights` (`shorts_pipeline.py:48`); sem chave ou sem quota, uma heurística por comprimento e espalhamento devolve sempre alguma coisa.
 - **Legendas karaoke por palavra** — `shorts_pipeline.extract_words_with_timestamps` (`shorts_pipeline.py:189`) distribui o tempo de cada segmento pelas palavras, pesando pelo comprimento de cada token.
 - **Ângulo editorial de um nicho** — `POST /api/strategy` devolve `angle`, `hook`, três `titles`, `visual_direction` e três `chapters`, com recurso local declarado.
 
 **Imagem**
-- **Stock media Pexels e Pixabay** — `pipeline.fetch_provider_media` (`pipeline.py:593`).
-- **Pesquisa de media por cena, com termos escritos pelo modelo** — `pipeline.extract_visual_terms_with_ai` (`pipeline.py:483`) pede ao modelo termos por cena; sem ele, `pipeline.extract_scene_keywords` (`pipeline.py:227`) extrai da legenda da própria cena. `pipeline.search_media_for_scenes` (`pipeline.py:549`) junta as duas.
+- **Stock media Pexels e Pixabay** — `pipeline.fetch_provider_media` (`pipeline.py:957`).
+- **Pesquisa de media por cena, com termos escritos pelo modelo** — `pipeline.extract_visual_terms_with_ai` (`pipeline.py:847`) pede ao modelo termos por cena; sem ele, `pipeline.extract_scene_keywords` (`pipeline.py:591`) extrai da legenda da própria cena. `pipeline.search_media_for_scenes` (`pipeline.py:913`) junta as duas.
 - **Rejeição de imagens com moldura branca** — `asset_quality.looks_padded` (`asset_quality.py:70`) mede com `ffmpeg signalstats` a duas profundidades em cada borda e rejeita o asset, que passa a candidato seguinte. O resultado entra em `render.rejected_assets`.
-- **Cache de media por URL** — `pipeline.download_media_asset` (`pipeline.py:668`) guarda em `storage/media/<projeto>/`, com o hash do URL no nome do ficheiro.
+- **Cache de media por URL** — `pipeline.download_media_asset` (`pipeline.py:1032`) guarda em `storage/media/<projeto>/`, com o hash do URL no nome do ficheiro.
 
 **Vídeo**
 - **Render HyperFrames via `npx`** — `render_engine.render_with_hyperframes` (`render_engine.py:892`) corre `npx --yes hyperframes@0.8.92 render`, que lança Chrome headless.
 - **Composição HTML com GSAP** — `render_engine.generate_composition_html` (`render_engine.py:483`) emite uma timeline por cena: fade, wipe de entrada, Ken Burns e desfoque com recuo do lado que sai.
 - **Grain e barra de progresso** — `_grain_overlay` (`render_engine.py:252`) e `_progress_bar` (`render_engine.py:271`) usam passos absolutos em tempos absolutos, não `infinite`, por isso o resultado é idêntico em qualquer frame.
-- **Storyboard com sobreposição de 0,7 s** — `pipeline.normalize_scene_timings` (`pipeline.py:319`) faz cada cena começar antes do seu tempo de origem, para o wipe ter o que revelar; os fins ficam na timeline de origem, para a narração ficar sincronizada.
+- **Storyboard com sobreposição de 0,7 s** — `pipeline.normalize_scene_timings` (`pipeline.py:683`) faz cada cena começar antes do seu tempo de origem, para o wipe ter o que revelar; os fins ficam na timeline de origem, para a narração ficar sincronizada.
 - **Assets copiados para dentro da composição** — `render_engine.stage_project_assets` (`render_engine.py:370`) copia tudo para `storage/outputs/.hf_<nome>/assets/`, porque o HyperFrames recusa recursos locais fora do directório do projecto.
 - **Cortes ao ritmo (beat-sync), loop contínuo, thumbnail e metadados de plataforma** — `viral_pipeline.detect_beats` (`viral_pipeline.py:40`), `make_seamless_loop` (`viral_pipeline.py:148`), `generate_optimized_thumbnail` (`viral_pipeline.py:174`) e `build_platform_metadata` (`viral_pipeline.py:221`). Exposto em `POST /api/build-viral`.
 - **Formatos** — `vertical` 1080x1920, `square` 1080x1080, `landscape` 1920x1080 (`render_engine.get_dimensions`, `render_engine.py:233`).
@@ -103,7 +103,7 @@ Cada linha aponta para o ficheiro e o símbolo que a implementam.
 - **Tratamento do erro no navegador** — `frontend/auth-handler.js` expõe `window.AuthHandler`: reenvia com backoff os códigos retentáveis, redirecciona para `/#settings` os de chave em falta ou rejeitada, e mostra um toast nos restantes.
 - **Só modelos `:free`** — verificado em três camadas: `POST /api/settings` recusa com `400` um modelo sem `:free`, `provider_registry._call_openrouter_compat` (`provider_registry.py:728`) volta a verificar antes de cada chamada, e não existe parâmetro nenhum que permita pedir um modelo pago.
 - **Multi-fornecedor** — `provider_registry.ProviderRegistry` (`provider_registry.py:174`) configura OpenRouter, NVIDIA, OpenCode, Gemini e OpenAI (`provider_registry.py:93`), com memória de quota lida dos cabeçalhos `x-ratelimit-*` (`provider_registry.py:685`).
-- **53 vozes `edge-tts` sem chave** — `tts.EDGE_VOICES` (`tts.py:133`), filtráveis por locale em `GET /api/voices`. OpenAI e Azure são alternativas opcionais (`tts.SUPPORTED_PROVIDERS`, `tts.py:101`).
+- **Catálogo de vozes `edge-tts` sem chave** — `GET /api/voices` serve o catálogo **ao vivo** (`edge_tts.list_voices()`) quando a rede responde e, quando não responde, o *snapshot* verificado `tts.EDGE_VOICES` (`tts.py:248`): **41 vozes** em 7 locales, das quais duas pt-PT, `pt-PT-DuarteNeural` e `pt-PT-RaquelNeural` — esta última é a voz por omissão (`tts.DEFAULT_VOICE`, `tts.py:125`). O *snapshot* é datado (`EDGE_VOICES_SNAPSHOT_DATE`, `tts.py:144`, lido de uma resposta real em 2026-10-04) e `get_tts_status` (`tts.py:512`) diz qual dos dois está em uso em vez de fingir confiança: `voice_source` é `"live"` ou `"offline_snapshot"`, e `voice_catalogue_verified` é falso enquanto se serve o *snapshot*. Filtrável por locale. OpenAI e Azure são alternativas opcionais (`tts.SUPPORTED_PROVIDERS`, `tts.py:170`).
 - **8 temas de estilo e 6 ambientes musicais** — `style._PRESET_LIST` (`style.py:412`) e `music.MOODS` (`music.py:52`); `music.BUILTIN_SPECS` (`music.py:98`) descreve 6 faixas sintetizadas localmente.
 - **WebUI servida pelo backend** — `backend/app.py:114-116` monta `frontend/` em `/app` com `html=True`.
 - **Docker** — `Dockerfile` de três estágios (`browser` com Chrome via Puppeteer, `builder` com o virtualenv, `runtime`), utilizador sem privilégios (uid 10001), volume nomeado para `storage/`, `init: true` e um `HEALTHCHECK`. Ver [docs/INSTALL.md#5-docker](docs/INSTALL.md#5-docker).
@@ -120,7 +120,7 @@ Cada linha aponta para o ficheiro e o símbolo que a implementam.
 | Pacotes Python | `requirements.txt` | ver o ficheiro | Sim |
 | Chaves de API | — | guião, estratégia, stock media | Não; sem elas há recurso local |
 
-O verificador classifica `faster-whisper` como **opcional** (`scripts/check_env.py:50`) e `librosa` como **obrigatório** (`scripts/check_env.py:48`). Os dois binários externos são classificados como opcionais, mas sem eles a geração de vídeo falha a meio — o servidor arranca na mesma.
+O verificador classifica `faster-whisper` como **opcional** (`scripts/check_env.py:50`) — hoje só o `POST /api/transcribe` o exige, porque o fluxo de um clique deriva as legendas do guião e não transcreve — e `librosa` como **obrigatório** (`scripts/check_env.py:48`). Os dois binários externos são classificados como opcionais, mas sem eles a geração de vídeo falha a meio — o servidor arranca na mesma.
 
 ---
 
@@ -134,7 +134,7 @@ curl -s http://127.0.0.1:8013/health
 
 # Catálogos (nunca falham: devolvem listas vazias em vez de erro)
 curl -s http://127.0.0.1:8013/api/presets          # 8 temas + vocabulários de legendas
-curl -s http://127.0.0.1:8013/api/voices            # 53 vozes edge-tts
+curl -s http://127.0.0.1:8013/api/voices            # catálogo edge-tts: ao vivo, ou 41 do snapshot offline
 curl -s http://127.0.0.1:8013/api/languages        # pt-PT, pt-BR, en-US, es-ES, fr-FR
 curl -s http://127.0.0.1:8013/api/music/tracks     # biblioteca musical + 6 ambientes
 
@@ -174,11 +174,11 @@ O que **não** funciona, ou funciona pior do que parece:
 ### Limitações conhecidas
 
 1. **`GET /api/jobs` devolve um array simples, não um envelope.** É a única rota que responde com `[...]` em vez de `{...}`. Um cliente que leia `resposta.jobs` obtém `undefined` em silêncio. O próprio frontend tem de se guardingar disso (`frontend/js/views/projects.js:155`). Escreva `for (const job of await r.json())`.
-2. **A transcrição degrada em silêncio.** Sem `faster-whisper`, ou quando o modelo não devolve segmentos, `pipeline.transcribe_audio_file` (`pipeline.py:64`) engole a excepção e devolve **cinco frases fixas em português**, cada uma de 3 segundos (`pipeline.py:84-94`). A resposta HTTP é `200` e não há campo de aviso. Um `.srt` inventado é exactamente o que `/api/tts` e `/api/build-video` vão consumir a seguir. Verificado: um MP3 de 3 bytes produz `200` com o SRT de recurso.
+2. **A transcrição já não degrada em silêncio, mas `/api/tts` ainda aceita um SRT de aviso.** `pipeline.transcribe_audio_file` (`pipeline.py:195`) tem três saídas e nenhuma é conteúdo inventado: segmentos reais; ou **um** segmento com `placeholder: true` (`pipeline.py:104`) cujo texto diz, em português, que aquilo não é a fala do áudio, com os tempos limitados à duração real do ficheiro; ou `TranscriptionFailed` (`pipeline.py:149`), com o erro verdadeiro, em vez de enchimento. Como `allow_placeholder` é verdadeiro por omissão, `/api/tts` sem `faster-whisper` instalado escreve esse SRT de aviso e responde `200` — visível na legenda, mas ainda um SRT. Uma falha real do modelo responde `422` (`backend/app.py:441`). Quem quiser o sinal no corpo da resposta usa `transcription_status` (`pipeline.py:279`), que é o que dá `degraded` verdadeiro à transcrição de recurso.
 3. **A quota diária dos modelos `:free` degrada para recurso local, sem falhar.** `_unavailable_reason` (`script_gen.py:146`) salta o pedido e `generate_script` devolve o guião de recurso com `source: "fallback-local"` e `fallback_error`. O `POST /api/script` marca `degraded` verdadeiro, mas **devolve `200`** — se ninguém ler o campo, a degradação é invisível. Para a tornar visível: `GET /api/providers` devolve `openrouter.quota_exhausted`.
 4. **Não existe autenticação em lado nenhum.** Não há login, não há palavra-passe, não há token. O `AuthHandler` do frontend trata de *chaves de fornecedores de terceiros*, não de acesso à aplicação. O backend escuta em `127.0.0.1` e a WebUI é uma app local de utilizador único. **Não exponha esta porta a uma rede.**
 5. **As preferências vivem só no `localStorage`.** `state.js` persiste `project`, `voice`, `style`, `music` e `preset` na chave `darkstudio.prefs.v1` (`frontend/js/state.js:9`, `frontend/js/state.js:75`). Não há armazenamento de projectos no servidor: `GET /api/projects` (`backend/app.py:1013`) lista **ficheiros** de `storage/uploads/`, não projectos; é o frontend que os agrupa por nome em `frontend/js/projects.js:13`.
-6. **As caches são por processo.** O cache de media (`pipeline._MEDIA_CACHE`, `pipeline.py:444`), o de quota (`provider_registry._OPENROUTER_QUOTA`, `provider_registry.py:669`) e o de qualidade de assets (`asset_quality._VERDICT_CACHE`, `asset_quality.py:67`) são dicionários ao nível do módulo. Com mais do que um processo de servidor, não são partilhados.
+6. **As caches são por processo.** O cache de media (`pipeline._MEDIA_CACHE`, `pipeline.py:808`), o de quota (`provider_registry._OPENROUTER_QUOTA`, `provider_registry.py:669`) e o de qualidade de assets (`asset_quality._VERDICT_CACHE`, `asset_quality.py:67`) são dicionários ao nível do módulo. Com mais do que um processo de servidor, não são partilhados.
 7. **Os testes `live` só gastam quota quando se pedem.** O `pytest.ini` já traz `addopts = -m "not live"` (`pytest.ini:21`), por isso um `pytest` a seco não chama a OpenRouter nem a Pexels. Os 9 testes de `tests/test_live_providers.py` só entram com `pytest -m live` (`pytest.ini:24`), e nesse caso batem a sério na rede e gastam quota real.
 8. **O override de GPU não acelera o render.** `docker-compose.gpu.yml` só dá CUDA ao `faster-whisper`. O Chrome corre com `--disable-gpu` e o encoder de saída é o `ffmpeg`, não o Chrome — está escrito no próprio ficheiro (`docker-compose.gpu.yml:14`). Para renders mais rápidos: mais CPU e mais RAM.
 9. **Dois testes de ponta a ponta expiram aos 900 s.** `tests/test_e2e.py:213` e `tests/test_e2e.py:221` fazem `POST /api/build-video` com `BUILD_VIDEO_TIMEOUT = 900` (`tests/test_e2e.py:25`). Numa máquina mais lenta, um render completo pode não caber.
@@ -187,7 +187,9 @@ O que **não** funciona, ou funciona pior do que parece:
 
 ### O que não foi medido
 
-Não corri a suite de testes nem um render completo neste ambiente: não há rede para o Edge TTS nem cabeçalhos de quota do OpenRouter. O que *foi* verificado em execução: a lista completa de rotas (`app.routes`), as respostas e os códigos de estado de todos os caminhos de erro documentados, os catálogos (53 vozes, 8 presets, 6 faixas, 6 ambientes), o `404` em `/`, o `200` em `/app/`, a forma do corpo `AUTH_*`, o ciclo de vida de um job (`queued` -> `running` -> `completed`, com um terceiro a ficar `queued` à espera de *slot*) e o `cancel_job` a meio, que aceita um `queued` e recusa um `running`. As contagens de linhas são de `wc -l`.
+Não corri a suite de testes neste ambiente: não há rede para o Edge TTS nem cabeçalhos de quota do OpenRouter. O que *foi* verificado em execução: a lista completa de rotas (`app.routes`), as respostas e os códigos de estado de todos os caminhos de erro documentados, os catálogos (41 vozes no snapshot offline, 8 presets, 6 faixas, 6 ambientes), o `404` em `/`, o `200` em `/app/`, a forma do corpo `AUTH_*`, o ciclo de vida de um job (`queued` -> `running` -> `completed`, com um terceiro a ficar `queued` à espera de *slot*) e o `cancel_job` a meio, que aceita um `queued` e recusa um `running`. As contagens de linhas são de `wc -l`.
+
+Um fluxo de um clique **completo**, medido noutro ambiente com rede, produziu um MP4 h264 1080x1920 + aac de 45 MB e 23,87 s, com sobreposição de 1,00 entre as palavras das legendas e as da narração — nenhum substituto sobreviveu — e latência máxima de *poll* de 25 ms, contra os 4,176 s medidos antes das correcções. O `duration_report` desse job diz, com o número real, que um alvo de 20 s deu 23,87 s porque a duração entregue segue a narração sintetizada e `duration_target` dimensiona o guião, não o áudio já gravado.
 
 ---
 
@@ -221,7 +223,7 @@ Dark-Studio/
 │                                 composition, main + pickers/ + views/
 ├── scripts/check_env.py          441 linhas · verificador de ambiente
 ├── storage/                      uploads, outputs, media, thumbnails, music
-├── tests/                        16 ficheiros
+├── tests/                        17 ficheiros
 ├── docs/                         INSTALL, ARCHITECTURE, API
 ├── Dockerfile, .dockerignore
 ├── docker-compose.yml, docker-compose.gpu.yml, docker/entrypoint.sh

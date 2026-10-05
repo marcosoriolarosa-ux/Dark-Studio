@@ -8,22 +8,22 @@ Todas as contagens vêm de `wc -l` sobre a árvore actual.
 
 ## 1. Mapa de módulos
 
-### Backend — 8681 linhas
+### Backend — 9889 linhas
 
 | Módulo | Linhas | Responsabilidade |
 | --- | --- | --- |
 | `backend/app.py` | 1048 | 27 rotas FastAPI, CORS, montagem de `/app`, modelos Pydantic, saneamento de nomes |
-| `backend/services/render_engine.py` | 1417 | Composição HTML, HyperFrames via `npx`, mistura de música com `ffmpeg`, directório de projecto |
-| `backend/services/provider_registry.py` | 1026 | Registo de fornecedores de IA, chaves múltiplas, memória de quota, retentativas |
+| `backend/services/render_engine.py` | 1418 | Composição HTML, HyperFrames via `npx`, mistura de música com `ffmpeg`, directório de projecto |
+| `backend/services/provider_registry.py` | 1027 | Registo de fornecedores de IA, chaves múltiplas, memória de quota, retentativas |
 | `backend/services/music.py` | 798 | Biblioteca musical: 6 faixas sintetizadas, uploads, manifesto, loop e parâmetros de mistura |
-| `backend/services/pipeline.py` | 739 | Transcrição, SRT, palavras-chave, storyboard, pesquisa de media, cache |
-| `backend/services/generator.py` | 715 | Orquestrador de um clique, registo de jobs, fila, marcos de progresso |
+| `backend/services/pipeline.py` | 1103 | Transcrição, SRT a partir de texto, palavras-chave, storyboard, pesquisa de media, cache |
+| `backend/services/generator.py` | 1185 | Orquestrador de um clique, registo de jobs, fila, marcos de progresso, legendas e relatório de duração |
 | `backend/services/style.py` | 626 | 8 temas, `SubtitleStyle`, validação e vocabulários fechados |
-| `backend/services/tts.py` | 582 | 53 vozes `edge-tts`, OpenAI e Azure; divisão de texto longo; estado de disponibilidade |
+| `backend/services/tts.py` | 951 | Catálogo de vozes `edge-tts` (41 no *snapshot* datado, ou o catálogo ao vivo), OpenAI e Azure; divisão de texto longo; estado de disponibilidade |
 | `backend/services/script_gen.py` | 575 | Guião em 5 idiomas, recurso local, extracção de termos visuais |
-| `backend/services/shorts_pipeline.py` | 491 | Detecção de destaques, karaoke por palavra, cut de formato curto |
-| `backend/services/viral_pipeline.py` | 363 | Beat-sync, loop contínuo, thumbnail, metadados de plataforma |
-| `backend/services/asset_quality.py` | 157 | Rejeição de imagens com moldura branca, via `ffmpeg signalstats` |
+| `backend/services/shorts_pipeline.py` | 492 | Detecção de destaques, karaoke por palavra, cut de formato curto |
+| `backend/services/viral_pipeline.py` | 364 | Beat-sync, loop contínuo, thumbnail, metadados de plataforma |
+| `backend/services/asset_quality.py` | 158 | Rejeição de imagens com moldura branca, via `ffmpeg signalstats` |
 | `backend/services/auth_contract.py` | 143 | Seis códigos `AUTH_*`, `AuthError`, mapeamento de estados HTTP |
 | `backend/services/__init__.py` | 1 | — |
 
@@ -60,7 +60,7 @@ Os 19 módulos de `frontend/js/` (excluindo `auth-handler.js`) somam 3885 linhas
 
 | Ficheiro | Linhas |
 | --- | --- |
-| `tests/*.py` (16 ficheiros) | 7419 |
+| `tests/*.py` (17 ficheiros) | 8600 |
 | `scripts/check_env.py` | 441 |
 | `Dockerfile` | 353 |
 | `start.bat` | 165 |
@@ -93,23 +93,31 @@ O frontend segue a mesma ideia. `frontend/js/api.js` é a única costura de rede
 
 ### 3.1 O caminho de um clique
 
-`generator.run_generation` (`generator.py:569`) conduz quatro etapas. O progresso é escrito por `_stage` (`generator.py:550`), que só mexe em `stage`, `progress` e `message` — **nunca** em `status`.
+`generator.run_generation` (`generator.py:1020`) conduz quatro etapas. O progresso é escrito por `_stage` (`generator.py:684`), que só mexe em `stage`, `progress` e `message` — **nunca** em `status`.
 
 | # | Etapa | Progresso | Chamadas |
 | --- | --- | --- | --- |
 | 1 | `script` | `0.05` | `script_gen.generate_script` |
-| 2 | `voice` | `0.20` | `tts.synthesize_speech_long`, `pipeline.transcribe_audio_file`, escrita do SRT |
+| 2 | `voice` | `0.20` | `tts.synthesize_speech_long`, `pipeline.build_srt_from_text` sobre `script.full_text`, escrita do SRT |
 | 3 | `media` | `0.40` | `pipeline.build_storyboard_from_segments`, `pipeline.search_media_for_scenes`, `pipeline.search_media_for_keywords` |
 | 4 | `render` | `0.60` | `style.resolve_preset_and_style`, `music.pick_track`, `render_engine.render_video_hyperframes` |
 | 5 | `done` | `1.00` | resultado anexado ao job; `status` passa a `completed` |
 
-Antes da etapa 1, `_project_slug` (`generator.py:82`) deriva o nome do projecto a partir de `project_prefix`, ou do tema. `slugify_topic` (`generator.py:98`) normaliza com NFKD, decompõe os acentos e reduz tudo o que não for alfanumérico a um hífen. O resultado nunca tem separadores de caminho nem `..`.
+Antes da etapa 1, `_project_slug` (`generator.py:133`) deriva o nome do projecto a partir de `project_prefix`, ou do tema. `slugify_topic` (`generator.py:224`) normaliza com NFKD, decompõe os acentos e reduz tudo o que não for alfanumérico a um hífen. O resultado nunca tem separadores de caminho nem `..`.
 
-**A degradação nunca é uma excepção.** Qualquer falha de etapa passa por `_fail` (`generator.py:558`), que escreve `status: "failed"`, uma mensagem em português e `progress: 0.0`, e devolve `{}`. O `_run_job` tem uma segunda rede (`generator.py:497`) para o caso de a excepção escapar do `run_generation`.
+**A degradação nunca é uma excepção.** Qualquer falha de etapa passa por `_fail` (`generator.py:712`), que escreve `status: "failed"`, uma mensagem em português e `progress: 0.0`, e devolve `{}`. O `_run_job` tem uma segunda rede (`generator.py:612`) para o caso de a excepção escapar do `run_generation`.
 
-Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)` (`generator.py:509`), para que o código sobreviva à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico.
+Um `AuthError` é desembrulhado para `CODIGO: mensagem (HTTP n)` (`generator.py:641`), para que o código sobreviva à travessia do pipeline em vez de ficar perdido dentro de um prefixo genérico.
 
-O `render_engine` não levanta quando o HyperFrames falha: devolve `status: "error"`. Por isso o pipeline trata esse caso como falha de etapa (`generator.py:680`), para o job não acabar `completed` com um resultado partido.
+O `render_engine` não levanta quando o HyperFrames falha: devolve `status: "error"`. Por isso o pipeline trata esse caso como falha de etapa (`generator.py:1135`), para o job não acabar `completed` com um resultado partido.
+
+**O que a tabela não diz.** Três decisões pesam mais do que a lista de chamadas:
+
+- **As legendas vêm do guião, não do áudio.** O gerador já tem `script.full_text` — a string exacta que o TTS leu — e deriva o SRT dela com `pipeline.build_srt_from_text` (`pipeline.py:377`) dentro de `_build_captions` (`generator.py:857`). Reconhecer a fala de um áudio sintetizado a partir dessa mesma string custa um modelo carregado mais uma descodificação inteira para devolver uma cópia pior do texto que já está na mão.
+- **Nada bloqueia o loop.** Toda a chamada bloqueante passa por `asyncio.to_thread`, e os serviços corrotina cujo corpo ainda bloqueia — TTS e render — por `_off_loop` (`generator.py:205`), que os conduz num loop privado dentro de um *thread*. É isto que tirou a paragem de `GET /api/jobs/{id}`: os 4,176 s de antes passaram a 25 ms de latência máxima de *poll* no mesmo fluxo.
+- **`output_stem` é único por job** (`generator.py:175`): o *slug* do tema mais o id do job, por omissão, com `_dedupe_output_stem` (`generator.py:157`) a resolver o resto. Antes, dois jobs do mesmo tema escreviam o mesmo MP4 e partilhavam o mesmo directório de trabalho do HyperFrames. Um `project_prefix` explícito continua a mandar: quem dá o nome é que decide.
+
+O resultado fecha com `degraded` a fundir o estado das legendas com a origem do guião, e com `duration_report` (`generator.py:967`), que compara a duração entregue com `duration_target` e diz em português porque é que falhou quando falha: `duration_target` dimensiona o *guião*, e a duração entregue segue a narração já sintetizada. Numa corrida real, um alvo de 20 s deu 23,87 s — e é isso que o campo diz, não um número redondo.
 
 ### 3.2 O caminho manual
 
@@ -123,33 +131,27 @@ POST /api/build-video  ->  pesquisa de media + composição + HyperFrames + MP4
 
 O truque que liga os dois: quando `POST /api/script` recebe `project_name`, guarda o guião em disco (`backend/app.py:177`). Depois, `POST /api/tts` com `text` vazio lê-o de volta (`backend/app.py:188`) e narra sem o cliente ter de reenviar o texto todo. Se não houver `full_text`, reconstrói a partir do gancho mais as secções.
 
-`POST /api/build-video` exige que o `.srt` exista (`backend/app.py:604`) — é o ficheiro que o `pipeline` consegue sempre interpretar, mesmo quando a transcrição degradou.
+`POST /api/build-video` exige que o `.srt` exista (`backend/app.py:604`) — é o ficheiro que o `pipeline` consegue sempre interpretar, mesmo quando o que lá dentro é um aviso de transcrição em falta e não fala.
 
-### 3.3 A degradação silenciosa da transcrição
+### 3.3 A transcrição não fabrica
 
-O ponto mais importante deste projecto, e o mais fácil de não ver.
+Isto foi, durante muito tempo, o ponto mais fácil de não ver deste projecto, e o pior.
 
-```python
-def transcribe_audio_file(file_path: Path) -> ...:
-    try:
-        from faster_whisper import WhisperModel
-        ...
-        if results:
-            return results
-    except Exception:
-        pass
-    phrases = ["A rotina moderna nos consome em excesso.", ...]
-    return [{"index": i+1, "start": i*3.0, "end": (i+1)*3.0, "text": p}
-            for i, p in enumerate(phrases)]
-```
+O que lá estava: um `except Exception: pass` à volta do `faster-whisper` e, logo a seguir, cinco frases fixas em português, cada uma com três segundos de tempos. Duas condições diferentes caíam no mesmo caminho — o pacote em falta e o modelo a devolver zero segmentos — e as duas produziam o mesmo SRT de 15 s, sem uma única palavra de som, com `200` e sem campo nenhum de aviso. Foi assim que um vídeo de 27 MB com a narração correcta acabou com legendas sobre deslocações e ioga, a reportar `degraded: false`.
 
-`pipeline.py:64`. Duas condições diferentes caem no mesmo caminho: o pacote em falta (`ImportError`) **e** o modelo a devolver zero segmentos. As duas resultam em cinco frases fixas em português, cada uma de 3 segundos, com um `200` e sem campo nenhum de aviso.
+O contrato actual (`pipeline.py:195`) tem três saídas, e nenhuma delas é conteúdo inventado:
 
-Não é teórico. `/api/tts` chama `transcribe_audio_file` logo a seguir a sintetizar a narração (`backend/app.py:436`) e escreve o SRT com o que recebeu; `/api/build-video` consome esse SRT a seguir. Verificado com um MP3 de 3 bytes: `200`, com o SRT de recurso. Um `.srt` inventado é exactamente o que vai para o vídeo.
+- **segmentos reais** — nenhum segmento marcado, e `transcription_status(segments)["degraded"]` é `False`;
+- **`faster-whisper` em falta** — um único segmento com `placeholder: true` (`pipeline.py:104`), `placeholder_reason`, uma mensagem em português que diz que aquilo não é a fala, e os tempos limitados à duração real do áudio (`_placeholder_transcript`, `pipeline.py:169`); com `allow_placeholder=False` levanta `TranscriptionDependencyMissing` em vez disso;
+- **o modelo correu e falhou, ou não devolveu nada** — `TranscriptionFailed` (`pipeline.py:149`), com o erro verdadeiro. Nunca engolido, nunca trocado por enchimento.
+
+`is_placeholder_transcript` (`pipeline.py:258`) e `transcription_status` (`pipeline.py:279`) existem para o chamador ter de *olhar* para o resultado em vez de o assumir; a segunda devolve o par `degraded` mais `fallback_error` que a WebUI já lê.
+
+Onde isto ainda pesa: o caminho manual. `/api/tts` transcreve a narração que acabou de sintetizar (`backend/app.py:436`) — o texto pode ter vindo do cliente e não do guião guardado, por isso não há texto fiável para repartir. Uma falha real do modelo é `422` (`backend/app.py:441`); sem o pacote, o SRT escrito é o aviso de uma linha, e diz isso na própria legenda. O fluxo de um clique nem chega aqui: deriva as legendas do guião, como em [3.1](#31-o-caminho-de-um-clique).
 
 ### 3.4 Pesquisa de media por cena
 
-`search_media_for_scenes` (`pipeline.py:549`) prefere termos escritos pelo modelo (`pipeline.py:483`) e, sem modelo, extrai-os da legenda da própria cena (`pipeline.py:227`). É a diferença entre um vídeo em que cada imagem corresponde ao que está a ser dito e um vídeo em que todas as cenas reciclam a mesma lista global.
+`search_media_for_scenes` (`pipeline.py:913`) prefere termos escritos pelo modelo (`pipeline.py:847`) e, sem modelo, extrai-os da legenda da própria cena (`pipeline.py:591`). É a diferença entre um vídeo em que cada imagem corresponde ao que está a ser dito e um vídeo em que todas as cenas reciclam a mesma lista global.
 
 Em `POST /api/build-video` a escolha é explícita (`backend/app.py:657`): o pool por cena ganha, e o pool global só é usado quando não há nenhum.
 
@@ -161,7 +163,7 @@ Em `POST /api/build-video` a escolha é explícita (`backend/app.py:657`): o poo
 
 ### 4.1 O registo
 
-`generator` mantém o estado ao nível do módulo (`generator.py:284`):
+`generator` mantém o estado ao nível do módulo (`generator.py:417`):
 
 ```python
 _jobs: Dict[str, Job] = {}
@@ -171,17 +173,17 @@ _running_ids: set = set()
 _next_seq: int = 0
 ```
 
-`MAX_CONCURRENT_JOBS = 2` (`generator.py:45`): cinco renders ao mesmo tempo esgotariam a memória de uma máquina normal. O semáforo é criado ao nível do módulo e reutilizado entre event loops, porque o `pytest-asyncio` cria um por teste.
+`MAX_CONCURRENT_JOBS = 2` (`generator.py:70`): cinco renders ao mesmo tempo esgotariam a memória de uma máquina normal. O semáforo é criado ao nível do módulo e reutilizado entre event loops, porque o `pytest-asyncio` cria um por teste.
 
-O registo é limitado por dois lados, em `_prune_locked` (`generator.py:310`): jobs terminados com mais de uma hora são removidos, e há um tecto duro de `MAX_JOB_HISTORY = 200`. Jobs em fila ou a correr **nunca** são podados, ou o servidor perderia trabalho.
+O registo é limitado por dois lados, em `_prune_locked` (`generator.py:443`): jobs terminados com mais de uma hora são removidos, e há um tecto duro de `MAX_JOB_HISTORY = 200`. Jobs em fila ou a correr **nunca** são podados, ou o servidor perderia trabalho.
 
-As leituras públicas devolvem cópias profundas. `get_job` (`generator.py:346`) e `list_jobs` (`generator.py:352`) usam `_copy_job` (`generator.py:362`), e `Job.to_dict` (`generator.py:261`) faz um round-trip por JSON dos campos mutáveis. Um cliente não consegue mexer no registo pelo que recebeu.
+As leituras públicas devolvem cópias profundas. `get_job` (`generator.py:479`) e `list_jobs` (`generator.py:485`) usam `_copy_job` (`generator.py:495`), e `Job.to_dict` (`generator.py:394`) faz um round-trip por JSON dos campos mutáveis. Um cliente não consegue mexer no registo pelo que recebeu.
 
-A ordenação usa `updated_at` **e** `_seq` (`generator.py:356`). Os timestamps ISO-8601 só têm granularidade de segundo, por isso dois jobs submetidos no mesmo segundo empatariam; o contador monotónico de inserção é o desempate estável.
+A ordenação usa `updated_at` **e** `_seq` (`generator.py:487`). Os timestamps ISO-8601 só têm granularidade de segundo, por isso dois jobs submetidos no mesmo segundo empatariam; o contador monotónico de inserção é o desempate estável.
 
 ### 4.2 Submeter
 
-`submit_job` (`generator.py:406`) valida, regista um job `queued` e devolve **imediatamente**. A validação é `GenerationRequest.validate` (`generator.py:153`), que devolve uma cópia com as omissões preenchidas e todos os campos dentro dos limites, levantando `ValueError` com mensagem em português no primeiro problema.
+`submit_job` (`generator.py:540`) valida, regista um job `queued` e devolve **imediatamente**. A validação é `GenerationRequest.validate` (`generator.py:279`), que devolve uma cópia com as omissões preenchidas e todos os campos dentro dos limites, levantando `ValueError` com mensagem em português no primeiro problema.
 
 Depois, se houver um event loop a correr, `loop.create_task` agenda o worker. Se não houver — um teste, um script síncrono — o job fica em fila e é o chamador que tem de conduzir `_run_job`. É por isso que `POST /api/generate` é `async def`: a rota tem de correr no loop, senão o `create_task` não tem onde aterrar e o job ficava para sempre em fila.
 
@@ -201,11 +203,11 @@ GENERATION_PARAM_FIELDS: frozenset[str] = frozenset(
 
 `Job.status` só toma os valores `queued`, `running`, `completed`, `failed` e `cancelled`, e a máquina de estados é monotónica: `queued -> running -> completed | failed`, mais a saída `queued -> cancelled`.
 
-**`_stage` nunca mexe em `status`** (`generator.py:550`): só em `stage`, `progress` e `message`. Quem escreve o estado é o *worker*, nas duas linhas a seguir a obter uma das *slots* do semáforo — `_running_ids.add(job_id)` e `job.status = "running"` (`generator.py:492-493`) — com a primeira marca de etapa logo a seguir (`generator.py:494`). Um job à espera de *slot* fica `queued`, com `progress: 0.0` e a mensagem de fila; por isso quem lê o snapshot distingue «à espera» de «a trabalhar» pelo `status`, sem adivinhar pelo `stage`.
+**`_stage` nunca mexe em `status`** (`generator.py:684`): só em `stage`, `progress` e `message`. Quem escreve o estado é o *worker*, nas duas linhas a seguir a obter uma das *slots* do semáforo — `_running_ids.add(job_id)` e `job.status = "running"` (`generator.py:626-627`) — com a primeira marca de etapa logo a seguir (`generator.py:628`). Um job à espera de *slot* fica `queued`, com `progress: 0.0` e a mensagem de fila; por isso quem lê o snapshot distingue «à espera» de «a trabalhar» pelo `status`, sem adivinhar pelo `stage`.
 
-É isso que dá a `cancel_job` (`generator.py:381`) uma garantia real. Ele recusa tudo o que não esteja `queued` (`generator.py:393-394`), portanto um job `running` devolve `False` e o `DELETE` responde `{"cancelled": false}`. Verificado em execução: com três jobs submetidos, dois passam a `running` e o terceiro fica `queued`; cancelar o terceiro dá `cancelled`, cancelar um dos dois não muda nada, e os dois completam. Não é uma falha do servidor — não existe interruptor partilhado, e interromper o HyperFrames a meio deixaria um MP4 truncado em `storage/outputs/`.
+É isso que dá a `cancel_job` (`generator.py:515`) uma garantia real. Ele recusa tudo o que não esteja `queued` (`generator.py:527-528`), portanto um job `running` devolve `False` e o `DELETE` responde `{"cancelled": false}`. Verificado em execução: com três jobs submetidos, dois passam a `running` e o terceiro fica `queued`; cancelar o terceiro dá `cancelled`, cancelar um dos dois não muda nada, e os dois completam. Não é uma falha do servidor — não existe interruptor partilhado, e interromper o HyperFrames a meio deixaria um MP4 truncado em `storage/outputs/`.
 
-O conjunto `_running_ids` (`generator.py:292`) serve ao *worker* para saber o que está dentro do semáforo; o `cancel_job` não o consulta. Decide pelo `status`, que é a mesma informação já publicada no snapshot.
+O conjunto `_running_ids` (`generator.py:425`) serve ao *worker* para saber o que está dentro do semáforo; o `cancel_job` não o consulta. Decide pelo `status`, que é a mesma informação já publicada no snapshot.
 
 O painel reproduz a mesma distinção: `frontend/js/generator.js:39` mapeia `queued` para «inactivo» antes de olhar para a etapa, enquanto `running` mapeia para a etapa real do pipeline (`frontend/js/generator.js:40-47`), com o rótulo de estado «A trabalhar».
 
@@ -224,7 +226,7 @@ A falta de interruptor partilhado está listada como limitação em [README.md](
 ### 5.1 As sete etapas
 
 1. **Resolver o storyboard.** Se não vier nenhum, `parse_srt_to_segments` e `build_storyboard_from_segments` tratam disso (`render_engine.py:1274`). Se mesmo assim ficar vazio, há uma cena de recurso, para que o HyperFrames tenha alguma coisa para renderizar.
-2. **Ajustar à duração do áudio.** Com `audio_duration` conhecida, `pipeline.fit_storyboard_to_duration` (`pipeline.py:719`) redistribui as cenas para o áudio, e não o contrário.
+2. **Ajustar à duração do áudio.** Com `audio_duration` conhecida, `pipeline.fit_storyboard_to_duration` (`pipeline.py:1083`) redistribui as cenas para o áudio, e não o contrário.
 3. **Preparar o directório.** `create_project_dir` (`render_engine.py:665`) cria `storage/outputs/.hf_<nome>/`, **apaga-o primeiro** para que assets de uma execução anterior nunca vazeiem, e escreve `hyperframes.json` e `package.json` com o *script* de render já fixado à versão.
 4. **Copiar os assets.** `stage_project_assets` (`render_engine.py:370`) copia media e áudio para `<project_dir>/assets/` e devolve referências relativas. É obrigatório: o HyperFrames recusa recursos locais fora do directório do projecto. Testa cada imagem com `looks_padded` (`render_engine.py:411`) e recolhe as rejeitadas.
 5. **Gerar o HTML.** `generate_composition_html` (`render_engine.py:483`) emite a composição com `build_subtitle_css` (`render_engine.py:183`) a aplicar o `SubtitleStyle` resolvido por `style.resolve_preset_and_style` (`style.py:611`). As animações por cena estão em `_scene_media_animations` (`render_engine.py:281`).
@@ -321,7 +323,7 @@ Duas sondas `HEAD` replacing uma chamada completa:
 
 ## 7. Layout de dados
 
-Tudo o que o utilizador não pode perder vive sob `storage/`, na raiz do projecto (`pipeline.py:39`). As cinco subpastas são as mesmas que o verificador cria e que o entrypoint do contentor garante (`scripts/check_env.py:80`, `docker/entrypoint.sh:55`).
+Tudo o que o utilizador não pode perder vive sob `storage/`, na raiz do projecto (`pipeline.py:35`). As cinco subpastas são as mesmas que o verificador cria e que o entrypoint do contentor garante (`scripts/check_env.py:80`, `docker/entrypoint.sh:55`).
 
 ```
 storage/
@@ -350,7 +352,7 @@ Três decisões merecem explicação:
 
 **O directório do HyperFrames vive em `outputs/`, não num temporário.** O comentário em `create_project_dir` (`render_engine.py:668`) diz porquê: um temporário convida o Chrome/Puppeteer a competir com a limpeza.
 
-**Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`). Mesmo quando a transcrição degradou, existe um SRT — o que é pior, num sentido: o pipeline nunca pára, apenas passa a fabricar conteúdo.
+**Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`), e `/api/tts` escreve-o logo a seguir à narração. O que mudou é o conteúdo: nunca é inventado em silêncio — ou é a transcrição, ou é um aviso de uma linha marcado como tal ([3.3](#33-a-transcricao-nao-fabrica)), ou o pedido falha com `422`.
 
 **A lista de projectos é derivada, não armazenada.** Não existe base de dados de projectos. `GET /api/projects` (`backend/app.py:1013`) lista os ficheiros de `storage/uploads/`, e é o frontend que os agrupa por nome antes de os mostrar (`frontend/js/projects.js:13`). Um projecto é, operacionalmente, «os ficheiros que partilham um mesmo radical».
 

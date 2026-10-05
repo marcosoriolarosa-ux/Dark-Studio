@@ -47,7 +47,7 @@ Sem eles o servidor arranca e a geração de vídeo falha a meio: `asset_quality
 
 ### 1.3 Node.js LTS
 
-O render não é Python: o motor chama `npx --yes hyperframes@0.8.92 render` (`render_engine.py:892`), que por sua vez lança Chrome headless. Sem `node`/`npx` não há vídeo.
+O render não é Python: o motor chama `npx --yes hyperframes@0.8.92 render` (`render_engine.py:927-931`), que por sua vez lança Chrome headless. Sem `node`/`npx` não há vídeo.
 
 Instale o **LTS** em <https://nodejs.org/en/download>. O Debian 12 traz Node 18, que já está em fim de vida; a imagem Docker usa explicitamente o 22.14.0 (`Dockerfile:23`).
 
@@ -103,7 +103,7 @@ Todas as chaves disponíveis, com o que cada uma liga:
 | `DARK_STUDIO_NO_BROWSER` | `1` impede a abertura do navegador | abre |
 | `DARK_STUDIO_RENDER_TIMEOUT` | segundos que um render pode correr antes de ser morto | 900 |
 
-O `DARK_STUDIO_RENDER_TIMEOUT` é lido do ambiente a cada render (`render_engine.py:726`), não uma vez no arranque: um valor em falta, vazio, não numérico ou não positivo vale 900. Passado o prazo, o render é morto como uma árvore de processos — `os.killpg` no POSIX, `taskkill /T /F` no Windows (`render_engine.py:823`) — e o resultado sai como uma falha comum, com mensagem em português, nunca como um MP4 truncado. Ver [O watchdog do render](ARCHITECTURE.md#54-o-watchdog-do-render).
+O `DARK_STUDIO_RENDER_TIMEOUT` é lido do ambiente a cada render (`render_engine.py:726`), não uma vez no arranque: um valor em falta, vazio, não numérico ou não positivo vale 900. Passado o prazo, o render é morto como uma árvore de processos — `os.killpg` no POSIX, `taskkill /T /F` no Windows (`render_engine.py:823`) — e o resultado sai como uma falha comum, com mensagem em português, nunca como um MP4 truncado. Os 900 s por omissão são generosos de propósito: um render real de 41 s a 1080x1920 mediu 316 s numa máquina de 2 vCPUs (1237 frames a ~3,9 fps), e hardware mais lento escala a partir daí, por isso o watchdog só apanha um Chrome ou `ffmpeg` encravado — nunca um render lento mas válido (`render_engine.py:734-738`). Ver [O watchdog do render](ARCHITECTURE.md#54-o-watchdog-do-render).
 
 O ficheiro é lido como UTF-8 e as chaves não devem ter acentos. **Nunca** coloque uma chave real no `.env.example`. O `.env` está no `.gitignore`, e a aplicação também o escreve sozinha quando usa `POST /api/settings`.
 
@@ -265,11 +265,11 @@ docker compose logs -f dark-studio
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
-**O que a GPU compra: só a transcrição.** O `faster-whisper` pode correr em CUDA, porque o `ctranslate2` sabe usar GPU. O override define `WHISPER_DEVICE=cuda` e `WHISPER_COMPUTE_TYPE=float16` (`docker-compose.gpu.yml:76`).
+**O que a GPU compra: a transcrição — mas, com o código como está, nem isso.** O `ctranslate2` sabe usar GPU, e o override define `WHISPER_DEVICE=cuda` (`docker-compose.gpu.yml:76`) e `WHISPER_COMPUTE_TYPE=float16` (`docker-compose.gpu.yml:78`). Só que `pipeline.transcribe_audio_file` instancia o modelo com `device="cpu"` e `compute_type="int8"` fixos no código (`pipeline.py:225`) e nunca lê essas duas variáveis: em todo o projecto, `WHISPER_DEVICE` e `WHISPER_COMPUTE_TYPE` só aparecem no próprio override. Um contentor com a VRAM reservada transcreve, portanto, em CPU — exactamente o modo de «instalei GPU e não ficou mais rápido» que o comentário do ficheiro descreve (`docker-compose.gpu.yml:71-75`). Some-se que `faster-whisper` é opcional e que o caminho de um clique não transcrece nada: o único trabalho que sobra para a GPU é transcrever áudio que o utilizador carregou.
 
-**O que a GPU não compra: o render.** O HyperFrames compõe frames com Chrome headless, e o Chrome neste contentor corre com `--disable-gpu`. Não há aceleração de vídeo no caminho e, mesmo que houvesse, o encoder de saída é o `ffmpeg`, não o Chrome. Isto está escrito no próprio ficheiro (`docker-compose.gpu.yml:14`). Para renders mais rápidos, a resposta é mais CPU e mais RAM.
+**O que a GPU não compra: o render, que é a parte cara.** O HyperFrames compõe frames com Chrome headless, e o Chrome neste contentor corre com `--disable-gpu` no wrapper que o `Dockerfile` instala (`Dockerfile:264`). Não há aceleração de vídeo no caminho e, mesmo que houvesse, o encoder de saída é o `ffmpeg`, não o Chrome. Isto está escrito no próprio ficheiro (`docker-compose.gpu.yml:14-20`). Para renders mais rápidos, a resposta é mais CPU e mais RAM: um render medido de 41 s a 1080x1920 levou 316 s numa máquina de 2 vCPUs.
 
-O custo é real: a base CUDA (`nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04`) ocupa 6-8 GB de imagem em vez dos ~2 GB da base Python. Só compensa se a transcrição com whisper for uso diário.
+O custo é real: a base CUDA (`nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04`) ocupa 6-8 GB de imagem em vez dos ~2 GB da base Python. E o benefício é mais estreito do que parece: com o modelo fixado em CPU e o caminho de um clique a não transcrever, só compensa se a transcrição com whisper de áudios carregados for mesmo uso diário.
 
 Pré-requisitos, a verificar na sua máquina e não assumidos pelo ficheiro: Docker 19.03+ com o runtime NVIDIA configurado, drivers 525+ e um contentor CUDA que arranque. Teste com:
 

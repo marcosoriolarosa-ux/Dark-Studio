@@ -93,15 +93,19 @@ Catálogo de vozes, opcionalmente filtrado por prefixo de locale (query `locale`
 ```json
 {
   "voices": {
-    {"id": "pt-PT-RicardoMultilingualNeural", "name": "Ricardo", "gender": "male", "locale": "pt-PT", "provider": "edge"}
+    {"id": "pt-PT-RaquelNeural", "name": "Raquel", "gender": "female", "locale": "pt-PT", "provider": "edge"}
   },
-  "default": "pt-PT-RicardoMultilingualNeural",
+  "default": "pt-PT-RaquelNeural",
   "locale": "",
   "providers": {"edge", "openai", "azure"}
 }
 ```
 
-São 53 vozes `edge-tts` sem chave (`tts.EDGE_VOICES`, `tts.py:133`); cada entrada tem os campos do dataclass `VoiceInfo` (`tts.py:119-124`). Uma falha no serviço degrada para `"voices": []` (`backend/app.py:348-364`).
+**A voz predefinida é `pt-PT-RaquelNeural`** (`tts.DEFAULT_VOICE`, `tts.py:125`). Os ids `pt-PT-Ricardo*`, `pt-PT-DuarteMultilingual*`, `pt-PT-FernandaNeural` e `pt-PT-InesNeural` estão **retirados** da Microsoft, e um id retirado não falha como pedido inválido: falha como um `NoAudioReceived` opaco que se lê exactamente como uma falha de rede. Foi assim que uma execução de um clique morreu na etapa `voice` ao fim de 4,1 s, com `AUTH_REQUEST_FAILED` / HTTP `502` a apontar o operador para as chaves de API em vez da causa.
+
+Esta rota serve **o catálogo ao vivo quando a rede responde e o *snapshot* offline quando não** (`tts.effective_voice_catalogue`, `tts.py:453-463`). O *snapshot* tem **41** entradas (`tts.EDGE_VOICES`, `tts.py:248-297`) e foi gerado de uma resposta real de `edge_tts.list_voices()` em **`2026-10-04`** (`tts.EDGE_VOICES_SNAPSHOT_DATE`, `tts.py:144`) — depois dessa data um id pode já ter sido retirado. Em `pt-PT` existem upstream exactamente **dois** ids: `pt-PT-DuarteNeural` e `pt-PT-RaquelNeural` (`tts.py:295-296`). Cada entrada tem os campos do dataclass `VoiceInfo` (`tts.py:188-193`).
+
+Um id bem formado que não esteja no catálogo é recusado **antes de qualquer chamada de rede**, com `TTS_UNKNOWN_VOICE` e HTTP `400` (`tts._validate_voice`, `tts.py:546-585`; `tts.unknown_voice_error`, `tts.py:200-237`) — nunca como `AUTH_REQUEST_FAILED`. Uma falha no serviço degrada para `"voices": []` (`backend/app.py:348-364`).
 
 ---
 
@@ -118,14 +122,24 @@ Que fornecedores de narração podem correr agora. **Sempre `200`**: um pacote o
     "openai": {"available": false, "requires_key": true},
     "azure": {"available": false, "requires_key": true}
   },
-  "default_voice": "pt-PT-RicardoMultilingualNeural",
+  "default_voice": "pt-PT-RaquelNeural",
   "default_provider": "edge",
-  "voices": 53,
+  "voices": 41,
+  "voice_source": "offline_snapshot",
+  "voice_catalogue_verified": false,
+  "voice_catalogue_snapshot_date": "2026-10-04",
+  "voice_catalogue_note": "Live Edge voice catalogue unreachable; ...",
   "ai_gateway": {"openrouter": {"enabled": true, "...": "..."}}
 }
 ```
 
-A forma vem de `tts.get_tts_status()` (`tts.py:239-250`); a chave `ai_gateway` é o mesmo payload de `GET /api/providers`. Uma excepção no serviço degrada para a forma mínima com a chave `error` (`backend/app.py:367-390`).
+A forma vem de `tts.get_tts_status()` (`tts.py:512-543`); a chave `ai_gateway` é o mesmo payload de `GET /api/providers`. Uma excepção no serviço degrada para a forma mínima com a chave `error` (`backend/app.py:367-390`).
+
+**Saber em que se pode confiar.** `voices` é o tamanho do catálogo que está a ser servido, e três chaves dizem se esse catálogo é verificado:
+
+- `voice_source`: `"live"` quando `edge_tts.list_voices()` respondeu, `"offline_snapshot"` quando não respondeu.
+- `voice_catalogue_verified`: `true` só quando `voice_source` é `"live"`. Com `false`, o número é de um *snapshot* datado, não do que a Microsoft tem agora.
+- Quando `voice_catalogue_verified` é `false`, o blob acrescenta ainda `voice_catalogue_snapshot_date` (a data de `EDGE_VOICES_SNAPSHOT_DATE`) e `voice_catalogue_note`, uma frase que diz explicitamente que a listagem não é ao vivo (`tts.py:531-542`). É esta honestidade que impede a interface de oferecer de novo um id morto com a confiança de uma contagem recente.
 
 ---
 
@@ -257,15 +271,17 @@ Estado de cada fornecedor de IA/media, mais o estado de narração no mesmo payl
       "openai": {"available": false, "requires_key": true},
       "azure": {"available": false, "requires_key": true}
     },
-    "default_voice": "pt-PT-RicardoMultilingualNeural",
+    "default_voice": "pt-PT-RaquelNeural",
     "default_provider": "edge",
-    "voices": 53,
+    "voices": 41,
+    "voice_source": "offline_snapshot",
+    "voice_catalogue_verified": false,
     "ai_gateway": {"...": "igual à chave providers"}
   }
 }
 ```
 
-A chave `providers` tem a forma de `provider_registry.get_provider_status()` (`provider_registry.py:700-722`): um fornecedor aparece `enabled: true` quando a chave respectiva está definida no ambiente. `quota_remaining` e `quota_limit` só ficam preenchidos depois de uma chamada real ao OpenRouter que devolva os cabeçalhos `x-ratelimit-*`; o estado vive na memória do processo e não é persistido. A chave `tts` tem a forma de `tts.get_tts_status()` (`tts.py:239-250`). Ambas as leituras são vigiadas: uma excepção degrada a chave correspondente em vez de falhar o pedido (`backend/app.py:867-889`).
+A chave `providers` tem a forma de `provider_registry.get_provider_status()` (`provider_registry.py:700-722`): um fornecedor aparece `enabled: true` quando a chave respectiva está definida no ambiente. `quota_remaining` e `quota_limit` só ficam preenchidos depois de uma chamada real ao OpenRouter que devolva os cabeçalhos `x-ratelimit-*`; o estado vive na memória do processo e não é persistido. A chave `tts` tem a forma de `tts.get_tts_status()` (`tts.py:512-543`), com as mesmas chaves `voice_source` / `voice_catalogue_verified` de [GET /api/tts/status](#4-get-apittsstatus). Ambas as leituras são vigiadas: uma excepção degrada a chave correspondente em vez de falhar o pedido (`backend/app.py:867-889`).
 
 ---
 
@@ -287,7 +303,7 @@ O corpo é JSON lido **cru**, como `Dict[str, Any]` (`backend/app.py:813`), e fi
 | --- | --- | --- | --- |
 | `topic` | string | *(obrigatório)* | Tema do vídeo. |
 | `language` | string | `"pt-PT"` | Um dos cinco idiomas de `script_gen.LANGUAGES`. |
-| `voice` | string | `"pt-PT-RicardoMultilingualNeural"` | Id de voz `edge-tts`. |
+| `voice` | string | `"pt-PT-RaquelNeural"` | Id de voz `edge-tts` (`tts.DEFAULT_VOICE`). |
 | `tts_provider` | string | `"edge"` | `edge`, `openai` ou `azure`. |
 | `rate` | string | `"+0%"` | Velocidade da narração. |
 | `section_count` | int | `5` | 1..10. |
@@ -313,7 +329,7 @@ O corpo é JSON lido **cru**, como `Dict[str, Any]` (`backend/app.py:813`), e fi
   "progress": 0.0,
   "stage": "script",
   "message": "Na fila, à espera de uma slot livre.",
-  "params": {"topic": "a história do café em Portugal", "language": "pt-PT", "voice": "pt-PT-RicardoMultilingualNeural", "tts_provider": "edge", "rate": "+0%", "section_count": 5, "tone": "documentary", "duration_target": 60, "custom_instructions": "", "aspect_ratio": "vertical", "preset": "cinematic", "subtitle_style": null, "music_track": null, "music_mood": "ambient", "music_volume": 0.18, "duck_voice": true, "include_captions": true, "project_prefix": ""},
+  "params": {"topic": "a história do café em Portugal", "language": "pt-PT", "voice": "pt-PT-RaquelNeural", "tts_provider": "edge", "rate": "+0%", "section_count": 5, "tone": "documentary", "duration_target": 60, "custom_instructions": "", "aspect_ratio": "vertical", "preset": "cinematic", "subtitle_style": null, "music_track": null, "music_mood": "ambient", "music_volume": 0.18, "duck_voice": true, "include_captions": true, "project_prefix": ""},
   "result": null,
   "error": null,
   "created_at": "2026-10-03T19:54:06Z",
@@ -435,8 +451,8 @@ Narra um projecto e deixa o MP3 e o SRT que `POST /api/build-video` espera. Corp
 | --- | --- | --- | --- |
 | `project_name` | string | `"demo_project"` | Nome do projecto, saneado. |
 | `text` | string | `""` | Texto a narrar; **vazio significa «narra o guião guardado para este projecto»** (`backend/app.py:402-404`). |
-| `voice` | string | `"pt-PT-RicardoMultilingualNeural"` | Id de voz; validado antes de qualquer chamada de rede. |
-| `provider` | string | `"edge"` | `edge`, `openai` ou `azure` (`tts.SUPPORTED_PROVIDERS`, `tts.py:101`). |
+| `voice` | string | `"pt-PT-RaquelNeural"` | Id de voz; validado contra o catálogo antes de qualquer chamada de rede (`TTS_UNKNOWN_VOICE` / `400`). |
+| `provider` | string | `"edge"` | `edge`, `openai` ou `azure` (`tts.SUPPORTED_PROVIDERS`, `tts.py:170`). |
 | `rate` | string | `"+0%"` | Velocidade. |
 | `volume` | string | `"+0%"` | Volume. |
 | `pitch` | string | `"+0Hz"` | Tom. |
@@ -449,14 +465,14 @@ Narra um projecto e deixa o MP3 e o SRT que `POST /api/build-video` espera. Corp
   "audio_file": "storage/uploads/cafe.mp3",
   "srt_file": "storage/uploads/cafe.srt",
   "segments": {{"index": 1, "start": 0.0, "end": 3.2, "text": "..."}, ...},
-  "voice": "pt-PT-RicardoMultilingualNeural",
+  "voice": "pt-PT-RaquelNeural",
   "provider": "edge",
   "characters": 1234,
   "estimated_seconds": 98.72
 }
 ```
 
-`estimated_seconds` é uma estimativa a 2,5 palavras por segundo (`WORDS_PER_SECOND`, `backend/app.py:166`). A seguir a sintetizar, a rota transcreve o próprio áudio para escrever o SRT (`backend/app.py:435-438`) — e é aí que entra a [degradação silenciosa](#16-post-apitranscribe): sem `faster-whisper`, o SRT são as cinco frases fixas e a resposta continua a ser `200`.
+`estimated_seconds` é uma estimativa a 2,5 palavras por segundo (`WORDS_PER_SECOND`, `backend/app.py:166`). A seguir a sintetizar, a rota transcreve o próprio áudio para escrever o SRT (`backend/app.py:435-438`). Sem `faster-whisper` o `.srt` continua a ser escrito e a resposta continua a ser `200`, mas leva **um único segmento de aviso** com `"placeholder": true` — não cinco frases inventadas. Ver [a degradação honesta](#16-post-apitranscribe).
 
 **Erros**
 
@@ -467,7 +483,7 @@ Narra um projecto e deixa o MP3 e o SRT que `POST /api/build-video` espera. Corp
 | `400` | mensagem do serviço | Voz inválida ou texto vazio — `ValueError` antes de qualquer chamada (`backend/app.py:426-428`) |
 | `401`/`403`/`402`/`429`/`502` | contrato `AUTH_*` | Chave em falta, rejeitada, quota, limite ou falha de rede do fornecedor — `AuthError` re-levantada para o handler global (`backend/app.py:422-425`) |
 | `422` | `"Não foi possível gerar a narração: <detalhe>"` | `edge-tts` ou `ffmpeg` em falta — `RuntimeError` (`backend/app.py:429-433`) |
-| `422` | `"Não foi possível gerar as legendas: <detalhe>"` | A transcrição do áudio falhou (`backend/app.py:439-446`) |
+| `422` | `"Não foi possível gerar as legendas: <detalhe>"` | A transcrição do áudio falhou — `pipeline.TranscriptionFailed` ou `TranscriptionDependencyMissing`, propagados pelo `except Exception` (`backend/app.py:439-446`) |
 
 ---
 
@@ -493,7 +509,15 @@ O conteúdo do upload é gravado tal e qual, com a extensão deduzida do nome do
 }
 ```
 
-> **Degradação silenciosa — o ponto mais fácil de não ver.** `pipeline.transcribe_audio_file` (`pipeline.py:64`) corre o `faster-whisper` dentro de um `try/except` que engole **qualquer** excepção. Duas condições diferentes caem no mesmo caminho: o pacote em falta (`ImportError`) **e** o modelo a devolver zero segmentos. As duas resultam nas mesmas cinco frases fixas em português, cada uma de 3 segundos (`pipeline.py:84-94`). O endpoint responde `200`, o SRT fica errado e **não existe campo de aviso**. A única forma de distinguir é comparar o texto devolvido com o áudio. Um `.srt` inventado é exactamente o que `/api/tts` e `/api/build-video` vão consumir a seguir. Verificado: um MP3 de 3 bytes produz `200` com o SRT de recurso.
+> **Degradação honesta — o aviso viaja dentro dos segmentos, não ao lado deles.** `pipeline.transcribe_audio_file` (`pipeline.py:195-255`) já não engole excepções nem fabrica legendas. Há três desfechos, todos distinguíveis por quem chamou:
+>
+> - **Transcrição real.** Nenhum segmento traz `placeholder`; `pipeline.transcription_status(segments)` devolve `transcript_source: "faster-whisper"`, `degraded: false`, `fallback_error: null`, `warning: null` (`pipeline.py:279-316`), e `pipeline.is_placeholder_transcript` devolve `False` (`pipeline.py:258-260`).
+> - **`faster-whisper` não instalado.** Devolve **exactamente um** segmento com `"placeholder": true` (chave `TRANSCRIPT_PLACEHOLDER_KEY`, `pipeline.py:104`), `placeholder_reason: "faster-whisper-not-installed"` (`pipeline.py:107`), uma `placeholder_message` em português que nomeia a causa e a instalação, e `duration_known` a dizer se a duração foi medida. O texto do segmento **é** o aviso (`PLACEHOLDER_TEXT`, `pipeline.py:131-133`), e o `end` é limitado à duração real do áudio medida por `ffprobe`, não a um valor inventado (`pipeline.py:169-192`). Com `allow_placeholder=False` o chamador recebe `TranscriptionDependencyMissing` em vez do segmento de aviso (`pipeline.py:145-146`, `pipeline.py:221`).
+> - **O modelo correu e falhou, ou devolveu zero segmentos.** `TranscriptionFailed` com o erro real, levantado em `pipeline.py:243-253`. Nunca engolido, nunca trocado por texto inventado.
+>
+> **`degraded` já não pode ser `false` ao lado de um *placeholder*.** `transcription_status` marca-o `true` tanto para segmentos de recurso como para uma lista vazia (`pipeline.py:294-316`), e `pipeline.transcript_issue` (`pipeline.py:263-276`) devolve o `{"reason", "message", "duration_known"}` da degradação.
+>
+> **O que cada rota faz com isto, e onde o aviso está.** `POST /api/transcribe` chama `transcribe_audio_file` sem `try/except` (`backend/app.py:574`): sem `faster-whisper` a resposta é `200` com o segmento de aviso no `segments` e um `.srt` que diz claramente não ser uma transcrição; uma falha genuína propaga como `500`, porque o único handler de excepção instalado é o de `AuthError` (`backend/app.py:81-84`). `POST /api/tts` envolve a mesma chamada e converte qualquer excepção em `422` (`backend/app.py:439-446`). **Nenhuma das duas rotas acrescenta um campo `degraded` ou `warning` ao payload**: o aviso tem de ser lido dos próprios segmentos, e o `.srt` de aviso é exactamente o que `/api/build-video` vai consumir a seguir. O fluxo de um clique é o único que faz a fusão: `generator.py:1144-1150` aplica `pipeline.transcription_status` a `degraded` e `fallback_error` antes de devolver o job.
 
 ---
 
@@ -881,7 +905,7 @@ Falhas de fornecedor — de IA ou de media — chegam ao cliente com a mesma for
 }
 ```
 
-**Seis códigos, emitidos pelo servidor** (`auth_contract.py:6-11`):
+**Seis códigos, emitidos pelo servidor** (`auth_contract.py:6-11`), mais um código declarado fora desse registo — ver a nota abaixo:
 
 | `error_code` | HTTP | Quando | Detalhes típicos |
 | --- | --- | --- | --- |
@@ -891,6 +915,8 @@ Falhas de fornecedor — de IA ou de media — chegam ao cliente com a mesma for
 | `AUTH_MODEL_NOT_FREE` | `400` | Modelo sem `:free` | `model`, `provider` |
 | `AUTH_QUOTA_EXCEEDED` | `402` | Créditos ou **quota diária de modelos `:free`** esgotados | `provider`, `upstream_status`, `upstream_body` |
 | `AUTH_REQUEST_FAILED` | `502` (ou o estado do fornecedor, quando não é 5xx) | Falha de rede, resposta vazia, outro estado do fornecedor | `provider`, `exception` ou `upstream_status` |
+
+**Um sétimo código, fora do registo de `auth_contract`:** `TTS_UNKNOWN_VOICE` (`tts.py:138`), HTTP `400`, quando um id de voz bem formado não está no catálogo (`tts._validate_voice`, `tts.py:546-585`). É deliberadamente distinto de `AUTH_REQUEST_FAILED`/`502`: um id inexistente é um erro do chamador, não de credenciais, e foi essa confusão que fez uma voz retirada parecer uma chave de API partida durante um mês.
 
 O mapeamento estado-a-código é `provider_status_error` (`auth_contract.py:91-134`): 401/403 -> `AUTH_INVALID_KEY`, 402 -> `AUTH_QUOTA_EXCEEDED`, 429 -> `AUTH_RATE_LIMIT`, resto -> `AUTH_REQUEST_FAILED` com `502` quando o estado é 5xx e o próprio estado caso contrário. `AuthError` herda de `RuntimeError` (`auth_contract.py:14-32`), pelo que um `except RuntimeError` já existente continua a apanhar tudo — mas `error_code` e `status_code` ficam disponíveis para a camada de API.
 
@@ -967,7 +993,7 @@ Catálogos (nunca falham: devolvem listas vazias em vez de erro):
 
 ```bash
 curl -s http://127.0.0.1:8013/api/presets       # 8 temas + vocabulários de legendas
-curl -s http://127.0.0.1:8013/api/voices        # 53 vozes edge-tts
+curl -s http://127.0.0.1:8013/api/voices        # catalogo edge-tts ao vivo; 41 no snapshot de 2026-10-04
 curl -s http://127.0.0.1:8013/api/languages     # pt-PT, pt-BR, en-US, es-ES, fr-FR
 curl -s http://127.0.0.1:8013/api/music/tracks  # biblioteca musical + 6 ambientes
 ```
