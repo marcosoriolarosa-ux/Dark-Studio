@@ -107,6 +107,8 @@ def strategy_payload(server):
 class TestStrategyEndpoint:
     """Contract tests: valid whether the free model answered or the fallback did."""
 
+    @pytest.mark.slow
+    @pytest.mark.live
     def test_strategy_returns_200(self, base_url):
         resp = requests.post(f"{base_url}/api/strategy", json={"niche": "fitness"}, timeout=120)
         assert resp.status_code == 200
@@ -115,12 +117,18 @@ class TestStrategyEndpoint:
         resp = requests.post(f"{base_url}/api/strategy", json={"niche": "   "}, timeout=30)
         assert resp.status_code == 400
 
+    @pytest.mark.slow
+    @pytest.mark.live
     def test_strategy_source_is_declared(self, strategy_payload):
         assert strategy_payload.get("source") in ("fallback-local", "openrouter-free")
 
+    @pytest.mark.slow
+    @pytest.mark.live
     def test_strategy_always_carries_the_required_fields(self, strategy_payload):
         assert REQUIRED_STRATEGY_FIELDS.issubset(set(strategy_payload.keys()))
 
+    @pytest.mark.slow
+    @pytest.mark.live
     def test_strategy_field_types_are_sane(self, strategy_payload):
         data = strategy_payload
         assert isinstance(data["angle"], str) and data["angle"].strip()
@@ -131,6 +139,8 @@ class TestStrategyEndpoint:
         assert all(isinstance(item, str) and item.strip() for item in data["titles"])
         assert all(isinstance(item, str) and item.strip() for item in data["chapters"])
 
+    @pytest.mark.slow
+    @pytest.mark.live
     def test_fallback_never_masquerades_as_a_model_answer(self, strategy_payload):
         data = strategy_payload
         if data["source"] == "fallback-local":
@@ -209,6 +219,7 @@ class TestFrontendServing:
 
 
 @pytest.mark.slow
+@pytest.mark.live
 class TestBuildVideo:
     def test_build_video_returns_200(self, base_url):
         resp = requests.post(
