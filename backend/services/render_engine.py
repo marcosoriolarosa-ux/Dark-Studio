@@ -1200,6 +1200,19 @@ def _apply_background_music(
 
     try:
         track = music.get_track(music_track)
+        if track is None:
+            # storage/music/ is gitignored, so a fresh checkout holds no WAVs at
+            # all and the pure read above answers None for a built-in id that is
+            # in the library: the track was never built, and building it is
+            # exactly what the library is for. Healing it here is what the music
+            # endpoints do before their read and what pick_track does for
+            # auto-BGM; get_track stays a pure read on purpose, because it also
+            # answers "does this id exist?", where writing a file would be a lie.
+            # Idempotent: once the library is on disk this costs one stat per
+            # spec. Retried once, so a genuinely unknown id still falls through
+            # to the honest note below.
+            music.ensure_builtin_library()
+            track = music.get_track(music_track)
     except Exception:  # pragma: no cover - music.py is total, belt and braces
         track = None
     if track is None:
