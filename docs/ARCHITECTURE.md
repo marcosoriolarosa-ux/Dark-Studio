@@ -147,7 +147,7 @@ O contrato actual (`pipeline.py:195`) tem três saídas, e nenhuma delas é cont
 
 `is_placeholder_transcript` (`pipeline.py:258`) e `transcription_status` (`pipeline.py:279`) existem para o chamador ter de *olhar* para o resultado em vez de o assumir; a segunda devolve o par `degraded` mais `fallback_error` que a WebUI já lê.
 
-Onde isto ainda pesa: o caminho manual. `/api/tts` transcreve a narração que acabou de sintetizar (`backend/app.py:436`) — o texto pode ter vindo do cliente e não do guião guardado, por isso não há texto fiável para repartir. Uma falha real do modelo é `422` (`backend/app.py:441`); sem o pacote, o SRT escrito é o aviso de uma linha, e diz isso na própria legenda. O fluxo de um clique nem chega aqui: deriva as legendas do guião, como em [3.1](#31-o-caminho-de-um-clique).
+Onde isto ainda pesa: o caminho manual. `/api/tts` transcreve a narração que acabou de sintetizar (`backend/app.py:436`) — o texto pode ter vindo do cliente e não do guião guardado, por isso não há texto fiável para partir em legendas. Uma falha real do modelo é `422` (`backend/app.py:441`); sem o pacote, o SRT escrito é o aviso de uma linha, e diz isso na própria legenda. O fluxo de um clique nem chega aqui: deriva as legendas do guião, como em [3.1](#31-o-caminho-de-um-clique).
 
 ### 3.4 Pesquisa de media por cena
 
@@ -352,7 +352,7 @@ Três decisões merecem explicação:
 
 **O directório do HyperFrames vive em `outputs/`, não num temporário.** O comentário em `create_project_dir` (`render_engine.py:668`) diz porquê: um temporário convida o Chrome/Puppeteer a competir com a limpeza.
 
-**Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`), e `/api/tts` escreve-o logo a seguir à narração. O que mudou é o conteúdo: nunca é inventado em silêncio — ou é a transcrição, ou é um aviso de uma linha marcado como tal ([3.3](#33-a-transcricao-nao-fabrica)), ou o pedido falha com `422`.
+**Um SRT é o contrato entre etapas.** `POST /api/build-video` recusa sem ele (`backend/app.py:604`), e `/api/tts` escreve-o logo a seguir à narração. O que mudou é o conteúdo: nunca é inventado em silêncio — ou é a transcrição, ou é um aviso de uma linha marcado como tal ([3.3](#33-a-transcrição-não-fabrica)), ou o pedido falha com `422`.
 
 **A lista de projectos é derivada, não armazenada.** Não existe base de dados de projectos. `GET /api/projects` (`backend/app.py:1013`) lista os ficheiros de `storage/uploads/`, e é o frontend que os agrupa por nome antes de os mostrar (`frontend/js/projects.js:13`). Um projecto é, operacionalmente, «os ficheiros que partilham um mesmo radical».
 
