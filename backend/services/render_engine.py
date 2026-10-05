@@ -1177,6 +1177,9 @@ def _apply_background_music(
     or a missing ffmpeg all come back as ``applied: False`` with a note naming
     the reason, because a render that succeeded must never be thrown away over a
     missing background bed.
+
+    ``note`` is never empty on any path that did not mix: a video with no bed is
+    a result worth explaining, and an empty string explained nothing.
     """
     report: Dict[str, Any] = {
         "requested": music_track or None,
@@ -1187,6 +1190,12 @@ def _apply_background_music(
         "note": "",
     }
     if not music_track:
+        # Auto-BGM wanted a bed and music.pick_track could not produce one, so
+        # the video ships silent. Reporting applied=False with an empty note left
+        # the user with a silent video and no explanation; the wording lives next
+        # to the library that failed to appear, so there is one phrasing of this
+        # failure rather than two.
+        report["note"] = music.missing_library_note()
         return video_path, report
 
     try:

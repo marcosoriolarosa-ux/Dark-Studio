@@ -22,6 +22,7 @@ from backend.services.music import (
     DEFAULT_MUSIC_VOLUME,
     MUSIC_DIR,
     AUDIO_SUFFIXES as MUSIC_AUDIO_SUFFIXES,
+    ensure_builtin_library,
     get_track,
     list_tracks,
     register_upload,
@@ -479,6 +480,14 @@ def get_music_tracks(mood: str = ""):
     if wanted and wanted not in MOODS:
         raise HTTPException(status_code=400, detail="Ambiente musical não suportado.")
     try:
+        # storage/music/ is gitignored, so a fresh checkout holds no WAVs at all
+        # and a pure read here answers []: an empty picker until some unrelated
+        # job happens to generate the library. Healing it at the endpoint is what
+        # pick_track does for auto-BGM. list_tracks itself stays a pure read on
+        # purpose, because it also answers "does this id exist?", where writing a
+        # file would be a lie. Idempotent: once the library is on disk this costs
+        # one stat per spec.
+        ensure_builtin_library()
         tracks = [_track_payload(item) for item in list_tracks(wanted)]
     except Exception:
         tracks = []
@@ -491,6 +500,11 @@ def search_music(q: str = ""):
     if not query:
         raise HTTPException(status_code=400, detail="Indique um termo de pesquisa.")
     try:
+        # Same defect as GET /api/music/tracks: searching an unmaterialised
+        # library finds nothing, so the picker looks broken on a fresh checkout.
+        # search_tracks stays a pure read over list_tracks; the self-heal is the
+        # endpoint's job.
+        ensure_builtin_library()
         tracks = [_track_payload(item) for item in search_tracks(query)]
     except Exception:
         tracks = []

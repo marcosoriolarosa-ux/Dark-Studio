@@ -1113,8 +1113,10 @@ async def run_generation(job: Job) -> dict:
     )
     music_track = params.get("music_track")
     if not music_track:
-        picked = music.pick_track(
-            params.get("music_mood", DEFAULT_MUSIC_MOOD), exclude_ids=None
+        picked = await asyncio.to_thread(
+            music.pick_track,
+            params.get("music_mood", DEFAULT_MUSIC_MOOD),
+            exclude_ids=None,
         )
         music_track = picked.id if picked else None
     render_result = await _off_loop(

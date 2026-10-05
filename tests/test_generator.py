@@ -725,3 +725,135 @@ class TestCaptionsDeriveFromText:
             text = seg.get("text", "")
             assert text, "segment text must not be empty"
             assert text in full_text, f"Segment '{text}' is not a substring of the narration"
+
+
+def _music_track(track_id="dark-depths", mood="dark"):
+    """A real music.Track for the pick_track stand-ins.
+
+    Real dataclass rather than a Mock: run_generation reads .id off the result,
+    so a stub that only answers the attributes a test happens to look at would
+    let a regression in the surrounding plumbing through unnoticed.
+    """
+    return gen.music.Track(
+        id=track_id,
+        title="Dark Depths",
+        mood=mood,
+        duration=40.0,
+        path="/tmp/" + track_id + ".wav",
+        builtin=True,
+        source="builtin",
+    )
+
+
+class TestMusicTrackSelection:
+    """Which track reaches the render, and where pick_track runs.
+
+    Two rules are pinned here. An explicit music_track wins outright and the
+    catalogue is never consulted for it. Without one, pick_track is consulted
+    with the requested mood - and it runs in a worker thread, because it
+    synthesises the builtin library on a fresh checkout (~5.6 s), the stall
+    that froze GET /api/jobs/{id} for 4.176 s the last time it sat on the loop.
+    """
+
+    def test_explicit_music_track_reaches_render_without_pick_track(self, fake_pipeline, monkeypatch):
+        """An explicit music_track is passed straight through to the render.
+
+        Catches a regression where mood selection starts overriding what the
+        caller asked for, or where pick_track starts running even though a track
+        was requested.
+        """
+        asked = []
+
+        def _pick(mood, exclude_ids=None):
+            asked.append(mood)
+            return _music_track("ambient-drift", "ambient")
+
+        monkeypatch.setattr(gen.music, "pick_track", _pick)
+
+        job = gen.submit_job({"topic": "dinheiro", "music_track": "lofi-nightfall"})
+        _run(job.job_id)
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert asked == [], "pick_track must not be consulted for an explicit track"
+        assert fake_pipeline.last_kwargs["music_track"] == "lofi-nightfall"
+        assert updated.result["music_track"] == "lofi-nightfall"
+
+    def test_mood_selection_is_used_when_no_explicit_track(self, fake_pipeline, monkeypatch):
+        """With no explicit track, pick_track decides and the render hears it.
+
+        Catches a regression where the mood argument is dropped or hardcoded,
+        where the chosen id never reaches the render, or where pick_track is
+        skipped and the job renders silently.
+        """
+        asked = []
+
+        def _pick(mood, exclude_ids=None):
+            asked.append((mood, exclude_ids))
+            return _music_track("dark-depths", "dark")
+
+        monkeypatch.setattr(gen.music, "pick_track", _pick)
+
+        job = gen.submit_job({"topic": "dinheiro", "music_mood": "dark"})
+        _run(job.job_id)
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert asked == [("dark", None)], "pick_track was not asked for the requested mood"
+        assert fake_pipeline.last_kwargs["music_track"] == "dark-depths"
+        assert updated.result["music_track"] == "dark-depths"
+
+    def test_slow_pick_track_leaves_the_event_loop_free(self, fake_pipeline, monkeypatch):
+        """A slow pick_track must not park the loop it is called from.
+
+        Regression guard for the ~5.6 s library synthesis a fresh checkout pays
+        inside pick_track. The stand-in blocks for half a second and records the
+        thread it ran on plus how many times the loop kept turning while it
+        did: called straight from the coroutine the count is zero, and the
+        WebUI progress poll stalls for the whole call.
+        """
+        import threading
+        import time
+
+        loop_thread = threading.current_thread().name
+        observed = {}
+        ticks = []
+
+        def _slow_pick(mood, exclude_ids=None):
+            observed["mood"] = mood
+            observed["thread"] = threading.current_thread().name
+            observed["ticks_before"] = len(ticks)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            observed["ticks_during"] = len(ticks) - observed["ticks_before"]
+            return _music_track("dark-depths", "dark")
+
+        monkeypatch.setattr(gen.music, "pick_track", _slow_pick)
+
+        job = gen.submit_job({"topic": "dinheiro", "music_mood": "dark"})
+
+        async def _run_and_heartbeat():
+            task = asyncio.create_task(gen._run_job(job.job_id))
+            while not task.done():
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.005)
+            await task
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_run_and_heartbeat())
+        finally:
+            loop.close()
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert observed, "pick_track was never consulted"
+        assert observed["thread"] != loop_thread, (
+            "pick_track ran on the event loop thread: " + observed["thread"]
+        )
+        assert observed["ticks_during"] >= 10, (
+            "the loop stopped turning during pick_track: "
+            + str(observed["ticks_during"]) + " ticks"
+        )
+        assert fake_pipeline.last_kwargs["music_track"] == "dark-depths"

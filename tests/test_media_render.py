@@ -13,6 +13,7 @@ import re
 
 import pytest
 
+from backend.services.music import missing_library_note
 from backend.services.pipeline import (
     build_storyboard_from_segments,
     extract_keywords_from_text,
@@ -1050,10 +1051,23 @@ class TestRenderPayloadCarriesTheNewKeys:
         assert result["status"] == "rendered"
         assert result["preset"] == "cinematic"
         assert result["subtitle_style"]["font_size"] == 52
-        assert result["music"] == {
-            "requested": None, "applied": False, "track_id": None,
-            "volume": 0.18, "duck_voice": True, "note": "",
-        }
+        reported = result["music"]
+        assert sorted(reported) == sorted(
+            "requested applied track_id volume duck_voice note".split()
+        )
+        assert reported["requested"] is None
+        assert reported["applied"] is False
+        assert reported["track_id"] is None
+        assert reported["volume"] == 0.18
+        assert reported["duck_voice"] is True
+        # A video with no bed is a result, not a failure the user can guess at:
+        # the note must say so, in Portuguese, reusing the wording that lives
+        # with the library that failed to appear. Only the note changed; the
+        # other fields above stay exactly what they were.
+        assert reported["note"] == missing_library_note()
+        assert reported["note"].strip(), (
+            "a silent video with an empty note is the defect this pins"
+        )
 
     def test_a_configured_style_and_preset_are_echoed_back(self, monkeypatch, tmp_path):
         engine = self._patched(monkeypatch, tmp_path)
@@ -1105,6 +1119,76 @@ class TestRenderPayloadCarriesTheNewKeys:
         assert result["music"]["applied"] is False
         assert result["music"]["volume"] == 0.3
         assert result["music"]["note"]
+
+
+class TestBackgroundMusicReportIsNeverSilent:
+    """``music.note`` is the only channel the job result has.
+
+    A render that ends with no bed used to report ``applied: False`` with an
+    empty note, which told the user nothing at all. The other branch has to stay
+    honest in the opposite direction: a bed that was mixed is a success and must
+    not be dressed up as the failure above.
+    """
+
+    def _engine(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        return engine
+
+    def test_no_track_at_all_is_explained_in_portuguese(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "sem-musica.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        path, reported = engine._apply_background_music(video, "", 0.18, True, 5.0)
+
+        assert path == video, "a missing bed must not cost the render"
+        assert reported["requested"] is None
+        assert reported["applied"] is False, "nothing was mixed, so nothing applied"
+        assert reported["track_id"] is None
+        note = reported["note"]
+        assert note == missing_library_note(), (
+            "one phrasing of this failure, owned by the music library"
+        )
+        assert note.strip()
+        for word in ("musica", "trilha", "video"):
+            assert word in note, note
+
+    def test_an_applied_track_reports_the_mix_not_the_failure_note(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "com-musica.mp4"
+        video.write_bytes(MP4_BYTES)
+        source = tmp_path / "ambient-drift.wav"
+        source.write_bytes(MP4_BYTES)
+
+        class FakeTrack:
+            id = "ambient-drift"
+            path = str(source)
+
+        monkeypatch.setattr(engine.music, "get_track", lambda track_id: FakeTrack())
+        monkeypatch.setattr(
+            engine.music,
+            "loop_to_duration",
+            lambda track, duration, output: pathlib.Path(output),
+        )
+
+        def fake_mix(video_in, track_in, output, **kwargs):
+            pathlib.Path(output).write_bytes(MP4_BYTES)
+            return pathlib.Path(output)
+
+        monkeypatch.setattr(engine, "mix_audio_track", fake_mix)
+
+        path, reported = engine._apply_background_music(
+            video, "ambient-drift", 0.18, True, 5.0
+        )
+
+        assert path == video
+        assert reported["applied"] is True
+        assert reported["track_id"] == "ambient-drift"
+        assert "misturada" in reported["note"]
+        assert reported["note"] != missing_library_note(), (
+            "a mixed bed must not be reported as a missing library"
+        )
 
 
 class TestRenderWatchdogIsBounded:

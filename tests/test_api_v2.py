@@ -8,6 +8,7 @@ The ``librosa`` and CORS-environment checks run in a subprocess: an import block
 and an env var both have to be in place *before* ``backend.app`` is imported, and
 reloading the module in-process would leak a second app into the other suites.
 """
+import dataclasses
 import json
 import os
 import subprocess
@@ -73,7 +74,13 @@ async def _fake_tts(text, output_path, **kwargs):
 
 @pytest.fixture
 def storage(tmp_path, monkeypatch):
-    """Point the app at a throwaway uploads directory and an empty music library."""
+    """Point the app at a throwaway uploads directory and an empty music library.
+
+    The empty music directory is the fresh-checkout state: storage/music/ is
+    gitignored, and the endpoints now heal it. The builtin specs are shortened to
+    1s here for the same reason tests/test_music.py shortens them, so that the
+    real synthesis stays a fixture detail instead of seconds of suite time.
+    """
     uploads = tmp_path / "uploads"
     music_dir = tmp_path / "music"
     uploads.mkdir()
@@ -82,6 +89,19 @@ def storage(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "MUSIC_DIR", music_dir)
     # register_upload resolves MUSIC_DIR from its own module, so both must move.
     monkeypatch.setattr(music_service, "MUSIC_DIR", music_dir)
+    monkeypatch.setattr(
+        music_service,
+        "BUILTIN_SPECS",
+        tuple(
+            dataclasses.replace(spec, duration=1.0)
+            for spec in music_service.BUILTIN_SPECS
+        ),
+    )
+    monkeypatch.setattr(
+        music_service,
+        "_BUILTIN_BY_ID",
+        dict((spec.id, spec) for spec in music_service.BUILTIN_SPECS),
+    )
     return uploads
 
 
@@ -129,9 +149,34 @@ class TestNewGetEndpoints:
         assert body["default_voice"] == DEFAULT_VOICE
 
     def test_music_tracks_shape(self, storage):
+        """A fresh checkout ships an empty storage/music/; the endpoint heals it."""
+        assert list(music_service.MUSIC_DIR.iterdir()) == [], (
+            "the fixture must be the empty state of a fresh checkout"
+        )
         response = client.get("/api/music/tracks")
         assert response.status_code == 200
         body = response.json()
+        tracks = body["tracks"]
+        assert tracks, "the picker must not be empty on a fresh checkout"
+        required = set("id title mood duration path builtin source".split())
+        for item in tracks:
+            assert required <= set(item)
+        assert all(item["builtin"] for item in tracks)
+        assert body["mood"] == ""
+        assert "ambient" in body["moods"]
+        # The heal is real work on disk, not a response body assembled in memory.
+        assert len(list(music_service.MUSIC_DIR.glob("*.wav"))) == len(tracks)
+
+    def test_music_tracks_filters_by_mood_after_healing(self, storage):
+        body = client.get("/api/music/tracks", params={"mood": "dark"}).json()
+        assert body["mood"] == "dark"
+        assert [item["id"] for item in body["tracks"]] == ["dark-depths"]
+
+    def test_music_tracks_is_empty_when_the_library_cannot_be_built(self, storage):
+        # The self-heal can still fail (no numpy, no writable directory). The
+        # endpoint then answers 200 with an empty list rather than invent tracks.
+        with mock.patch.object(app_module, "ensure_builtin_library", return_value=[]):
+            body = client.get("/api/music/tracks").json()
         assert body["tracks"] == []
         assert "ambient" in body["moods"]
 
@@ -142,9 +187,24 @@ class TestNewGetEndpoints:
 
     def test_music_search_requires_a_query(self, storage):
         assert client.get("/api/music/search", params={"q": "  "}).status_code == 400
+        assert client.get("/api/music/search", params={"q": ""}).status_code == 400
+
+    def test_music_search_sees_the_library_it_heals(self, storage):
+        # Same defect as the tracks endpoint: a search of an unmaterialised
+        # library finds nothing, so the picker reads as broken.
+        assert list(music_service.MUSIC_DIR.iterdir()) == [], (
+            "the fixture must be the empty state of a fresh checkout"
+        )
         response = client.get("/api/music/search", params={"q": "ambient"})
         assert response.status_code == 200
-        assert response.json() == {"tracks": [], "query": "ambient"}
+        body = response.json()
+        assert body["query"] == "ambient"
+        assert [item["id"] for item in body["tracks"]] == ["ambient-drift"]
+
+    def test_music_search_is_empty_when_the_library_cannot_be_built(self, storage):
+        with mock.patch.object(app_module, "ensure_builtin_library", return_value=[]):
+            body = client.get("/api/music/search", params={"q": "ambient"}).json()
+        assert body["tracks"] == []
 
 
 class TestVoices:
