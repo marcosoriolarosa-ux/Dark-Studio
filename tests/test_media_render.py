@@ -596,6 +596,7 @@ class TestSrtRoundTrip:
 # --------------------------------------------------------------------------
 
 import asyncio  # noqa: E402  (kept next to the tests that use them)
+import dataclasses  # noqa: E402
 import os  # noqa: E402
 import pathlib  # noqa: E402
 import signal  # noqa: E402
@@ -1189,6 +1190,151 @@ class TestBackgroundMusicReportIsNeverSilent:
         assert reported["note"] != missing_library_note(), (
             "a mixed bed must not be reported as a missing library"
         )
+
+
+class TestExplicitMusicTrackHealsTheLibrary:
+    """An explicitly requested id must not be refused for want of a built library.
+
+    ``music.get_track`` is a pure read, so on a fresh checkout - where
+    ``storage/music/*`` is gitignored and the directory is empty - naming a
+    built-in track resolved to nothing and the render reported that track as
+    missing. It was never missing, only unbuilt, and building it is what the
+    library is for. The call site now heals the library and retries the lookup
+    once, the way the music endpoints and ``pick_track`` already do, while a
+    genuinely unknown id still gets the honest error.
+
+    The directory starts genuinely empty and lives in ``tmp_path``, so these
+    tests never touch the repository's own storage/music/; short specs keep the
+    real self-heal fast, exactly as tests/test_music.py does.
+    """
+
+    SHORT_DURATION = 1.0
+
+    def _engine(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        return engine
+
+    def _empty_music_dir(self, monkeypatch, engine, tmp_path):
+        """An isolated MUSIC_DIR in the state a fresh checkout is in."""
+        target = tmp_path / "fresh-music"
+        target.mkdir()
+        monkeypatch.setattr(engine.music, "MUSIC_DIR", target)
+        monkeypatch.setattr(
+            engine.music,
+            "BUILTIN_SPECS",
+            tuple(
+                dataclasses.replace(spec, duration=self.SHORT_DURATION)
+                for spec in engine.music.BUILTIN_SPECS
+            ),
+        )
+        monkeypatch.setattr(
+            engine.music,
+            "_BUILTIN_BY_ID",
+            dict((spec.id, spec) for spec in engine.music.BUILTIN_SPECS),
+        )
+        return target
+
+    def _fake_mix(self, monkeypatch, engine):
+        """No ffmpeg: the mix stages the payload and reports it back."""
+        monkeypatch.setattr(
+            engine.music,
+            "loop_to_duration",
+            lambda track, duration, output: pathlib.Path(output),
+        )
+
+        def fake_mix(video_in, track_in, output, **kwargs):
+            pathlib.Path(output).write_bytes(MP4_BYTES)
+            return pathlib.Path(output)
+
+        monkeypatch.setattr(engine, "mix_audio_track", fake_mix)
+
+    def test_an_explicit_builtin_id_resolves_on_an_empty_library(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        library = self._empty_music_dir(monkeypatch, engine, tmp_path)
+        self._fake_mix(monkeypatch, engine)
+        video = tmp_path / "pedido.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        path, reported = engine._apply_background_music(
+            video, "ambient-drift", 0.18, True, 5.0
+        )
+
+        assert path == video
+        assert reported["requested"] == "ambient-drift"
+        assert reported["applied"] is True, (
+            "a built-in id the library is able to build must not be reported "
+            "as missing on a fresh checkout"
+        )
+        assert reported["track_id"] == "ambient-drift"
+        assert "misturada" in reported["note"]
+        assert reported["note"] != missing_library_note(), (
+            "a mixed bed must not be reported as a missing library"
+        )
+        assert (library / "ambient-drift.wav").exists(), (
+            "the self-heal has to build the track, not merely stop complaining"
+        )
+
+    def test_a_genuinely_unknown_id_still_reports_it_is_missing(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        library = self._empty_music_dir(monkeypatch, engine, tmp_path)
+        video = tmp_path / "desconhecida.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        path, reported = engine._apply_background_music(
+            video, "no-such-track", 0.18, True, 5.0
+        )
+
+        assert path == video, "an unknown id must not cost the render"
+        assert reported["applied"] is False
+        assert reported["track_id"] is None
+        assert reported["note"] == (
+            "musica ignorada: trilha 'no-such-track' nao encontrada."
+        ), "the wording for a genuinely unknown id is unchanged"
+        assert list(library.glob("*.wav")), (
+            "the self-heal is still attempted for an unknown id, and only the "
+            "id itself is then refused"
+        )
+
+    def test_the_heal_is_a_no_op_once_the_library_exists(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        library = self._empty_music_dir(monkeypatch, engine, tmp_path)
+        self._fake_mix(monkeypatch, engine)
+        engine.music.ensure_builtin_library()
+        before = dict(
+            (item.name, (item.stat().st_mtime_ns, item.stat().st_size))
+            for item in library.glob("*.wav")
+        )
+        assert len(before) == len(engine.music.BUILTIN_SPECS)
+
+        calls = []
+        real_ensure = engine.music.ensure_builtin_library
+
+        def counted_ensure():
+            calls.append(True)
+            return real_ensure()
+
+        monkeypatch.setattr(engine.music, "ensure_builtin_library", counted_ensure)
+
+        video = tmp_path / "repetida.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        path, reported = engine._apply_background_music(
+            video, "dark-depths", 0.18, True, 5.0
+        )
+
+        assert path == video
+        assert reported["applied"] is True
+        assert reported["track_id"] == "dark-depths"
+        assert calls == [], (
+            "the self-heal must not run when the id already resolves, or every "
+            "render pays the full generation cost again"
+        )
+        after = dict(
+            (item.name, (item.stat().st_mtime_ns, item.stat().st_size))
+            for item in library.glob("*.wav")
+        )
+        assert after == before, "a track that already exists is never regenerated"
 
 
 class TestRenderWatchdogIsBounded:
