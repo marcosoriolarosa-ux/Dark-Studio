@@ -73,7 +73,7 @@ O que o `pip` instala, e porque:
 | --- | --- | --- |
 | Web | `fastapi`, `uvicorn[standard]`, `python-multipart`, `pydantic`, `httpx`, `python-dotenv` | Versões fixadas para instalações reprodutíveis |
 | Áudio/vídeo | `numpy`, `librosa` | Pesados. O primeiro `import librosa` demora vários segundos (numba) |
-| Transcrição | `faster-whisper` | Arrasta `ctranslate2` e `onnxruntime`: download grande. O servidor arranca sem ele |
+| Transcrição | `faster-whisper` | **Opcional**: `check_env.py:50` marca-o `AVISO`, não `FALTA`, e o servidor arranca sem ele. Só é preciso para transcrever áudio que o servidor não escreveu — `POST /api/transcribe` e a SRT do `POST /api/tts`. Arrasta `ctranslate2` e `onnxruntime`: download grande. O caminho de um clique não o usa: deriva as legendas do texto do guião |
 | Voz | `edge-tts` | A voz por omissão, sem chave. É o pacote mais importante depois do FastAPI |
 | Testes | `pytest`, `pytest-asyncio`, `requests` | `pytest.ini` usa `asyncio_mode = auto`, que o `pytest-asyncio` fornece |
 
@@ -191,7 +191,7 @@ python scripts/check_env.py --pick-port  # imprime a primeira porta livre a part
 python scripts/check_env.py --check-port 8013   # imprime free ou busy
 ```
 
-`--machine` muda a saída do modo de portas para pares `CHAVE=valor`, que é o que os dois atalhos consomem. As 29 verificações cobrem: versão do Python, se está num virtualenv, os dez pacotes obrigatórios, os três de teste, os quatro binários, a escrita em `storage/`, a presença do `.env` e as nove chaves.
+`--machine` muda a saída do modo de portas para pares `CHAVE=valor`, que é o que os dois atalhos consomem. As 29 verificações cobrem: versão do Python, se está num virtualenv, os dez pacotes Python (nove obrigatórios e o `faster-whisper` opcional, `check_env.py:40-51`), os três de teste, os quatro binários, a escrita em `storage/`, a presença do `.env` e as nove chaves.
 
 Depois, para o servidor:
 
@@ -350,7 +350,15 @@ Por ordem de probabilidade:
 
 ### As legendas não batem com a narração
 
-Não há `faster-whisper` instalado. Verifique com `GET /api/tts/status`. **Atenção:** neste caso o servidor não dá erro nenhum — `pipeline.transcribe_audio_file` engole a excepção e escreve cinco frases fixas de 3 segundos cada (`pipeline.py:84-94`). A resposta é `200` e não existe campo de aviso. Para o distinguir, instale `faster-whisper` e repita.
+Primeiro, o que é que está a correr. O caminho de um clique (`POST /api/generate`) **não usa `faster-whisper`**: já tem em mãos o texto exacto que o TTS leu (`script.full_text`) e deriva as legendas desse texto com `pipeline.build_srt_from_text` (`pipeline.py:377`), em vez de transcrever um áudio cujo texto conhece (`generator.py:857-870`). Num vídeo gerado por esse caminho as legendas erram porque a narração não corresponde ao guião guardado, ou porque os tempos são estimados — leia em `GET /api/jobs/{job_id}` os campos `caption_builder`, `caption_duration_source` e `caption_reasons`: dizem se as legendas saíram do `pipeline.build_srt_from_text` ou do corte local, e se a duração veio do `ffprobe` ou de uma estimativa a partir do número de palavras (`generator.py:897-909`, `generator.py:1174-1176`).
+
+`faster-whisper` só entra em `POST /api/transcribe` (áudio carregado pelo utilizador) e na metade da SRT do `POST /api/tts`. Aí `transcribe_audio_file` já não engole nada, e tem três saídas distinguíveis (`pipeline.py:195-255`):
+
+- **Transcrição real** — nenhum segmento leva marcador, `is_placeholder_transcript()` dá `False` (`pipeline.py:258`) e `transcription_status()` devolve `degraded: false` (`pipeline.py:279`).
+- **`faster-whisper` em falta** — sai **um único** segmento com `placeholder: true`, `placeholder_reason: "faster-whisper-not-installed"` e uma `placeholder_message` em português a dizer que aquele texto não é a fala do áudio (`pipeline.py:104-133`, `pipeline.py:169-192`). A legenda é literalmente `[SEM TRANSCRIÇÃO: faster-whisper não instalado - pip install faster-whisper]`, por isso o aviso aparece no SRT e queimado no próprio vídeo. A marca de tempo é a duração real do áudio medida com o `ffprobe`, e só cai para 5 s se o `ffprobe` falhar (`pipeline.py:153-166`, `pipeline.py:138`). Com `allow_placeholder=False` o mesmo caso levanta `TranscriptionDependencyMissing` (`pipeline.py:221`).
+- **`faster-whisper` instalado mas a transcrição falha** — levanta `TranscriptionFailed` com o erro real, nunca engolido nem trocado por texto inventado (`pipeline.py:149`, `pipeline.py:243-253`). `POST /api/transcribe` não apanha essa excepção, por isso responde `500`; `POST /api/tts` apanha-a e responde `422` com a mensagem do erro (`backend/app.py:444-446`).
+
+Para confirmar se o pacote está cá, corra `python scripts/check_env.py`: a linha `pacote faster-whisper` aparece como `AVISO` quando falta. **`GET /api/tts/status` não diz nada sobre isto** — só reporta os fornecedores de TTS (`backend/app.py:367-390`).
 
 ### O guião sai genérico
 
