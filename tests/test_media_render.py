@@ -1061,13 +1061,12 @@ class TestRenderPayloadCarriesTheNewKeys:
         assert reported["track_id"] is None
         assert reported["volume"] == 0.18
         assert reported["duck_voice"] is True
-        # A video with no bed is a result, not a failure the user can guess at:
-        # the note must say so, in Portuguese, reusing the wording that lives
-        # with the library that failed to appear. Only the note changed; the
-        # other fields above stay exactly what they were.
-        assert reported["note"] == missing_library_note()
-        assert reported["note"].strip(), (
-            "a silent video with an empty note is the defect this pins"
+        # This render asked for no bed, so the empty note is the honest answer:
+        # only an auto-BGM failure blames the library, and that is pinned in
+        # TestBackgroundMusicReportIsNeverSilent. The other fields above stay
+        # exactly what they were.
+        assert reported["note"] == "", (
+            "silence the caller asked for must not be reported as a library failure"
         )
 
     def test_a_configured_style_and_preset_are_echoed_back(self, monkeypatch, tmp_path):
@@ -1123,12 +1122,15 @@ class TestRenderPayloadCarriesTheNewKeys:
 
 
 class TestBackgroundMusicReportIsNeverSilent:
-    """``music.note`` is the only channel the job result has.
+    """An auto-BGM render that ends with no bed has to explain itself.
 
-    A render that ends with no bed used to report ``applied: False`` with an
-    empty note, which told the user nothing at all. The other branch has to stay
-    honest in the opposite direction: a bed that was mixed is a success and must
-    not be dressed up as the failure above.
+    ``music.note`` is the only channel the job result has. Auto-BGM wanted a
+    track, ``music.pick_track`` produced nothing, and reporting ``applied: False``
+    with an empty note told the user nothing at all: a silent video with no
+    explanation. ``music_auto=True`` is what marks that situation, and on it the
+    note must still carry the wording owned by the library. The other branch has
+    to stay honest in the opposite direction: a bed that was mixed is a success
+    and must not be dressed up as the failure above.
     """
 
     def _engine(self, monkeypatch, tmp_path):
@@ -1141,7 +1143,9 @@ class TestBackgroundMusicReportIsNeverSilent:
         video = tmp_path / "sem-musica.mp4"
         video.write_bytes(MP4_BYTES)
 
-        path, reported = engine._apply_background_music(video, "", 0.18, True, 5.0)
+        path, reported = engine._apply_background_music(
+            video, "", 0.18, True, 5.0, music_auto=True
+        )
 
         assert path == video, "a missing bed must not cost the render"
         assert reported["requested"] is None
@@ -1189,6 +1193,179 @@ class TestBackgroundMusicReportIsNeverSilent:
         assert "misturada" in reported["note"]
         assert reported["note"] != missing_library_note(), (
             "a mixed bed must not be reported as a missing library"
+        )
+
+
+class TestDeliberateSilenceIsNotBlamedOnTheLibrary:
+    """An empty ``music_track`` means two different things, and the note must not
+    collapse them.
+
+    ``music.pick_track`` failing and a caller asking for no music both arrive as
+    an empty ``music_track``, so the renderer used to answer both with the
+    library-failure note - telling a user who deliberately wanted silence that
+    the library had no usable track. ``music_auto`` carries the difference:
+    False is deliberate silence and reports an empty note, True is the auto-BGM
+    failure and keeps the library wording. The flag must also stay unable to
+    override a track that was actually named.
+    """
+
+    def _engine(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        return engine
+
+    def test_deliberate_silence_reports_an_empty_note(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "silencio.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        path, reported = engine._apply_background_music(
+            video, "", 0.18, True, 5.0, music_auto=False
+        )
+
+        assert path == video
+        assert reported["requested"] is None
+        assert reported["applied"] is False
+        assert reported["track_id"] is None
+        assert reported["note"] == "", (
+            "no bed was asked for, so there is nothing to explain: the library "
+            "note here would be a lie about a bed nobody wanted"
+        )
+
+    def test_the_two_flags_produce_the_two_contracts_for_one_empty_track(
+        self, monkeypatch, tmp_path
+    ):
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "mesmo-video.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        _, auto = engine._apply_background_music(
+            video, "", 0.18, True, 5.0, music_auto=True
+        )
+        _, deliberate = engine._apply_background_music(
+            video, "", 0.18, True, 5.0, music_auto=False
+        )
+
+        assert auto["note"] == missing_library_note()
+        assert deliberate["note"] == ""
+        assert auto["applied"] is False and deliberate["applied"] is False
+        assert auto["track_id"] is None and deliberate["track_id"] is None
+
+    def test_the_flag_defaults_to_deliberate_silence(self, monkeypatch, tmp_path):
+        """Omitting the flag must not accuse the library.
+
+        Every call site that predates it relies on the default, so a future
+        caller that forgets to pass it gets silence rather than a false failure.
+        """
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "omissao.mp4"
+        video.write_bytes(MP4_BYTES)
+
+        _, reported = engine._apply_background_music(video, "", 0.18, True, 5.0)
+
+        assert reported["note"] == ""
+        assert reported["applied"] is False
+        assert reported["track_id"] is None
+
+    @pytest.mark.parametrize("music_auto", [False, True])
+    def test_a_named_track_mixes_under_either_flag(self, monkeypatch, tmp_path, music_auto):
+        """The flag only talks about the no-track case.
+
+        An id the caller named is a request either way: it has to be mixed and
+        reported as mixed, whatever ``music_auto`` says.
+        """
+        engine = self._engine(monkeypatch, tmp_path)
+        video = tmp_path / "com-musica.mp4"
+        video.write_bytes(MP4_BYTES)
+        source = tmp_path / "ambient-drift.wav"
+        source.write_bytes(MP4_BYTES)
+
+        class FakeTrack:
+            id = "ambient-drift"
+            path = str(source)
+
+        monkeypatch.setattr(engine.music, "get_track", lambda track_id: FakeTrack())
+        monkeypatch.setattr(
+            engine.music,
+            "loop_to_duration",
+            lambda track, duration, output: pathlib.Path(output),
+        )
+
+        def fake_mix(video_in, track_in, output, **kwargs):
+            pathlib.Path(output).write_bytes(MP4_BYTES)
+            return pathlib.Path(output)
+
+        monkeypatch.setattr(engine, "mix_audio_track", fake_mix)
+
+        path, reported = engine._apply_background_music(
+            video, "ambient-drift", 0.18, True, 5.0, music_auto=music_auto
+        )
+
+        assert path == video
+        assert reported["applied"] is True
+        assert reported["track_id"] == "ambient-drift"
+        assert "misturada" in reported["note"]
+        assert reported["note"] != missing_library_note()
+
+
+class TestRenderVideoCarriesTheMusicAutoFlag:
+    """``render_video_hyperframes`` has to pass the flag down, not just accept it.
+
+    A signature that takes ``music_auto`` and never forwards it would leave every
+    unit test above green while every real render still blamed the library, so
+    the thread is pinned here through the public entry point. The render
+    subprocess is faked: no HyperFrames, no chrome, no ffmpeg.
+    """
+
+    def _engine(self, monkeypatch, tmp_path):
+        engine = render_engine_module()
+        monkeypatch.setattr(engine, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(engine, "stage_project_assets", lambda *a, **k: ({}, None, []))
+        monkeypatch.setattr(engine, "get_media_duration", lambda _p: 5.0)
+        monkeypatch.setattr(engine, "cleanup_render_dirs", lambda keep=None: 0)
+
+        async def fake_render(project_name, composition_html, output_path, *args):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(MP4_BYTES)
+            return {"status": "rendered", "output_path": str(output_path), "stdout": ""}
+
+        monkeypatch.setattr(engine, "render_with_hyperframes", fake_render)
+        return engine
+
+    def _srt(self, tmp_path, stem):
+        srt = tmp_path / (stem + ".srt")
+        srt.write_text("1\n00:00:00,000 --> 00:00:04,000\nfalou\n", encoding="utf-8")
+        return srt
+
+    def test_auto_bgm_reaches_the_library_note(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        srt = self._srt(tmp_path, "auto")
+
+        result = asyncio.run(
+            engine.render_video_hyperframes("auto", srt, music_auto=True)
+        )
+
+        assert result["status"] == "rendered"
+        assert result["music"]["applied"] is False
+        assert result["music"]["note"] == missing_library_note(), (
+            "the flag reached the music stage as False here: an auto-BGM failure "
+            "would be reported to the user as silence"
+        )
+
+    def test_deliberate_silence_reaches_the_empty_note(self, monkeypatch, tmp_path):
+        engine = self._engine(monkeypatch, tmp_path)
+        srt = self._srt(tmp_path, "silencioso")
+
+        result = asyncio.run(
+            engine.render_video_hyperframes("silencioso", srt, music_auto=False)
+        )
+
+        assert result["status"] == "rendered"
+        assert result["music"]["applied"] is False
+        assert result["music"]["track_id"] is None
+        assert result["music"]["note"] == "", (
+            "the flag reached the music stage as True here: silence the caller "
+            "asked for would be reported as a library failure"
         )
 
 

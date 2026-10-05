@@ -339,10 +339,14 @@ async def render_viral_video(
 
     # Render
     pool_urls = [item.get("url", "") for item in media_pool if item.get("url")]
+    # This pipeline names no track and never calls music.pick_track (there is no
+    # music reference anywhere in it), so the cut is deliberately silent and the
+    # render must say nothing about the library.
     render_result = await render_video_hyperframes(
         safe_name, srt_path, storyboard, audio_path, aspect_ratio,
         media_pool=pool_urls,
         output_stem=f"{safe_name}_viral",
+        music_auto=False,
     )
 
     # Save metadata

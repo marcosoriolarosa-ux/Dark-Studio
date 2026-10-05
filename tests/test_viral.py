@@ -3,6 +3,8 @@
 import pytest
 from pathlib import Path
 
+from backend.services import viral_pipeline as vp
+
 from backend.services.viral_pipeline import (
     detect_beats,
     snap_to_nearest_beat,
@@ -131,6 +133,85 @@ class TestPlatformMetadata:
         tags = meta["hashtags"]
         # Should extract meaningful terms
         assert any("bitcoin" in tag.lower() or "cripto" in tag.lower() or "invest" in tag.lower() for tag in tags)
+
+
+SRT_TEXT = (
+    "1\n00:00:00,000 --> 00:00:05,000\nA primeira frase do video viral.\n\n"
+    "2\n00:00:05,000 --> 00:00:11,000\nA segunda frase do video viral.\n"
+)
+
+
+class TestViralRenderAsksForDeliberateSilence:
+    """The viral cut passes no track and asks for none.
+
+    render_viral_video names no music_track and never calls music.pick_track
+    (there is no music reference anywhere in viral_pipeline.py), so the empty
+    music_track it hands the renderer means silence by design. This pins the
+    music_auto value it sends, because a wrong True would have the render tell
+    the user the library had no usable track for a cut that was always going to
+    be silent - a failure nobody caused and nothing can fix.
+    """
+
+    async def test_the_render_is_asked_for_deliberate_silence(
+        self, tmp_path, monkeypatch
+    ):
+        srt_path = tmp_path / "viral.srt"
+        srt_path.write_text(SRT_TEXT, encoding="utf-8")
+        monkeypatch.setattr(vp, "UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr(vp, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(vp, "search_media_for_scenes", lambda storyboard, **kw: ({}, "none"))
+        monkeypatch.setattr(vp, "search_media_for_keywords", lambda kw: [])
+        monkeypatch.setattr(
+            vp, "generate_optimized_thumbnail",
+            lambda *a, **k: str(tmp_path / "thumb.html"),
+        )
+
+        seen = []
+
+        async def fake_render(*args, **kwargs):
+            seen.append(kwargs)
+            return {"status": "rendered", "output_path": str(tmp_path / "viral_viral.mp4")}
+
+        monkeypatch.setattr(vp, "render_video_hyperframes", fake_render)
+
+        await vp.render_viral_video("viral", srt_path, aspect_ratio="vertical")
+
+        assert len(seen) == 1, "the cut must still render exactly once"
+        assert "music_track" not in seen[0], (
+            "this pipeline selects no track, so the renderer must not be told one"
+        )
+        assert seen[0]["music_auto"] is False, (
+            "sending True here would report a library failure for silence by design"
+        )
+
+    def test_the_pipeline_selects_no_music_of_its_own(self):
+        """The verdict above rests on this: no pick_track, no music_track.
+
+        Read off the parsed module rather than the raw text, so the comments that
+        explain the verdict do not count as uses of it. If someone later wires
+        auto-BGM or a named track into this pipeline, this fails first and the
+        music_auto=False above has to be revisited with it.
+        """
+        import ast
+
+        tree = ast.parse(Path(vp.__file__).read_text(encoding="utf-8"))
+        referenced = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                referenced.add(node.attr)
+            elif isinstance(node, ast.Name):
+                referenced.add(node.id)
+            elif isinstance(node, ast.keyword) and node.arg:
+                referenced.add(node.arg)
+
+        assert "pick_track" not in referenced, (
+            "auto-BGM has been wired into this pipeline: the music_auto verdict "
+            "has to be revisited with it"
+        )
+        assert "music_track" not in referenced, (
+            "this pipeline now names a track, so it is no longer a caller that "
+            "asks for deliberate silence"
+        )
 
 
 class TestViralPipelineIntegration:

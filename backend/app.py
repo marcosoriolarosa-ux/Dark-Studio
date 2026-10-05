@@ -702,6 +702,9 @@ async def build_video(
         "music_track": music_track.strip(),
         "music_volume": volume,
         "duck_voice": duck,
+        # This endpoint never calls music.pick_track: an empty music_track is the
+        # form saying "no bed", so the render must not blame the library for it.
+        "music_auto": False,
     }
     render_kwargs = {
         name: value

@@ -1112,7 +1112,12 @@ async def run_generation(job: Job) -> dict:
         params.get("subtitle_style"),
     )
     music_track = params.get("music_track")
+    # The flag is this module's own truth, not a default: music_auto is True only
+    # on the branch where pick_track was consulted, so an empty music_track below
+    # can only mean auto-BGM was asked for and the library produced nothing.
+    music_auto = False
     if not music_track:
+        music_auto = True
         picked = await asyncio.to_thread(
             music.pick_track,
             params.get("music_mood", DEFAULT_MUSIC_MOOD),
@@ -1132,6 +1137,7 @@ async def run_generation(job: Job) -> dict:
             music_track=music_track,
             music_volume=params.get("music_volume", DEFAULT_MUSIC_VOLUME),
             duck_voice=params.get("duck_voice", DEFAULT_DUCK_VOICE),
+            music_auto=music_auto,
         )
     )
     if isinstance(render_result, dict) and render_result.get("status") == "error":

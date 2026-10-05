@@ -803,6 +803,58 @@ class TestMusicTrackSelection:
         assert fake_pipeline.last_kwargs["music_track"] == "dark-depths"
         assert updated.result["music_track"] == "dark-depths"
 
+    def test_auto_bgm_that_produced_nothing_is_marked_auto(self, fake_pipeline):
+        """A failed auto-BGM pick must still reach the render as an auto request.
+
+        Catches the flag being hardcoded or left at its default on this branch:
+        the render receives an empty music_track either way, so if music_auto
+        says False here the user is shown deliberate silence instead of the real
+        failure, and the library-failure note never appears at all.
+        """
+        job = gen.submit_job({"topic": "dinheiro"})
+        _run(job.job_id)
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert fake_pipeline.last_kwargs["music_track"] is None, (
+            "the fake pick_track returns nothing on purpose"
+        )
+        assert fake_pipeline.last_kwargs["music_auto"] is True
+
+    def test_an_explicit_track_is_not_marked_auto(self, fake_pipeline):
+        """A named track is the caller's choice, not an auto-BGM request.
+
+        Catches the flag being set unconditionally: with music_auto True the
+        renderer would treat a later problem with this render as a library
+        failure the user never caused.
+        """
+        job = gen.submit_job({"topic": "dinheiro", "music_track": "lofi-nightfall"})
+        _run(job.job_id)
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert fake_pipeline.last_kwargs["music_track"] == "lofi-nightfall"
+        assert fake_pipeline.last_kwargs["music_auto"] is False
+
+    def test_a_track_the_mood_picked_is_still_marked_auto(self, fake_pipeline, monkeypatch):
+        """A successful pick is auto-BGM too, and says so.
+
+        The id is non-empty here, so the flag changes nothing today; pinning it
+        keeps the signal honest if the renderer ever reads it on a mixed path.
+        """
+        def _pick(mood, exclude_ids=None):
+            return _music_track("dark-depths", "dark")
+
+        monkeypatch.setattr(gen.music, "pick_track", _pick)
+
+        job = gen.submit_job({"topic": "dinheiro", "music_mood": "dark"})
+        _run(job.job_id)
+
+        updated = gen.get_job(job.job_id)
+        assert updated.status == "completed", updated.error
+        assert fake_pipeline.last_kwargs["music_track"] == "dark-depths"
+        assert fake_pipeline.last_kwargs["music_auto"] is True
+
     def test_slow_pick_track_leaves_the_event_loop_free(self, fake_pipeline, monkeypatch):
         """A slow pick_track must not park the loop it is called from.
 

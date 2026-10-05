@@ -1169,6 +1169,8 @@ def _apply_background_music(
     music_volume: float,
     duck_voice: bool,
     total_duration: float,
+    *,
+    music_auto: bool = False,
 ) -> tuple[Path, Dict[str, Any]]:
     """Mix *music_track* into *video_path* and report what happened.
 
@@ -1178,8 +1180,17 @@ def _apply_background_music(
     the reason, because a render that succeeded must never be thrown away over a
     missing background bed.
 
-    ``note`` is never empty on any path that did not mix: a video with no bed is
-    a result worth explaining, and an empty string explained nothing.
+    ``music_auto`` is the signal that separates the two reasons an empty
+    *music_track* can arrive here. True means auto-BGM asked for a bed and
+    ``music.pick_track`` could not produce one, so ``note`` carries
+    ``music.missing_library_note()``. False means the caller asked for silence,
+    so ``note`` stays empty: there is nothing to explain, and blaming the library
+    for a bed nobody asked for would be a lie.
+
+    The note is therefore never empty on a path that failed to deliver a bed that
+    was asked for - the auto case above, an unknown id, an unusable file, a failed
+    mix. It is empty on exactly one path, deliberate silence, where
+    ``applied: False`` is the request rather than a failure.
     """
     report: Dict[str, Any] = {
         "requested": music_track or None,
@@ -1190,12 +1201,15 @@ def _apply_background_music(
         "note": "",
     }
     if not music_track:
-        # Auto-BGM wanted a bed and music.pick_track could not produce one, so
-        # the video ships silent. Reporting applied=False with an empty note left
-        # the user with a silent video and no explanation; the wording lives next
-        # to the library that failed to appear, so there is one phrasing of this
-        # failure rather than two.
-        report["note"] = music.missing_library_note()
+        if music_auto:
+            # Auto-BGM wanted a bed and music.pick_track could not produce one, so
+            # the video ships silent. Reporting applied=False with an empty note left
+            # the user with a silent video and no explanation; the wording lives next
+            # to the library that failed to appear, so there is one phrasing of this
+            # failure rather than two.
+            report["note"] = music.missing_library_note()
+        # Deliberate silence (music_auto False): the note stays empty and applied
+        # stays False, because silence is what this caller asked for.
         return video_path, report
 
     try:
@@ -1269,6 +1283,7 @@ async def render_video_hyperframes(
     music_track: Optional[str] = None,
     music_volume: float = music.DEFAULT_MUSIC_VOLUME,
     duck_voice: bool = True,
+    music_auto: bool = False,
 ) -> Dict[str, Any]:
     """Render a project to MP4.
 
@@ -1280,8 +1295,11 @@ async def render_video_hyperframes(
     background bed mixed in after HyperFrames has produced the MP4. Music is
     strictly a post-process and never fatal: a missing track or a missing ffmpeg
     still returns ``status="rendered"`` with ``music.applied = False`` and a note
-    explaining why. The payload always carries ``preset``, the resolved
-    ``subtitle_style`` and the ``music`` block, on success and on error alike.
+    explaining why. ``music_auto`` says whether the caller was after auto-BGM: with
+    no ``music_track`` an auto-BGM failure reports that the library could not supply
+    a bed, while deliberate silence reports an empty note. The payload always
+    carries ``preset``, the resolved ``subtitle_style`` and the ``music`` block,
+    on success and on error alike.
 
     A render that outruns ``DARK_STUDIO_RENDER_TIMEOUT`` is killed and reported
     like any other failure - ``status="error"`` carrying a Portuguese message -
@@ -1346,6 +1364,7 @@ async def render_video_hyperframes(
         output_path, music_report = _apply_background_music(
             output_path, music_track, music_volume, duck_voice,
             float(video_duration or 0.0) or float(total_duration or 0.0),
+            music_auto=music_auto,
         )
         video_duration = get_media_duration(output_path)
 

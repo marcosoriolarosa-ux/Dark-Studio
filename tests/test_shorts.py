@@ -292,6 +292,91 @@ class TestGenerateShortsContract:
         assert "scenes,\n        None," in source or "scenes, None," in source
 
 
+class TestShortsRenderAsksForDeliberateSilence:
+    """The shorts cut passes no track and asks for none.
+
+    generate_shorts names no music_track and never calls music.pick_track (there
+    is no music reference anywhere in shorts_pipeline.py), so the empty
+    music_track it hands the renderer means silence by design - the cut is
+    captions with no bed. This pins the music_auto value it sends, because a wrong
+    True would have the render blame the library for a cut that was always going
+    to be silent.
+    """
+
+    def _srt(self, tmp_path):
+        text = "\n\n".join(
+            f"{item['index']}\n"
+            f"00:00:{int(item['start']):02d},000 --> 00:00:{int(item['end']):02d},000\n"
+            f"{item['text']}"
+            for item in SAMPLE
+        )
+        (tmp_path / "corte.srt").write_text(text, encoding="utf-8")
+        return tmp_path / "corte.srt"
+
+    def test_the_render_is_asked_for_deliberate_silence(self, tmp_path, monkeypatch):
+        from backend.services import pipeline as pipeline_module
+        from backend.services import render_engine as engine_module
+
+        self._srt(tmp_path)
+        monkeypatch.setattr(sp, "UPLOAD_DIR", tmp_path)
+        monkeypatch.setattr(sp, "OUTPUT_DIR", tmp_path)
+        monkeypatch.setattr(pipeline_module, "search_media_for_keywords", lambda kw: [])
+        monkeypatch.setattr(
+            sp, "detect_highlights",
+            lambda segments, transcript="", niche="general": [
+                {"start": 0.0, "end": 6.0, "text": SAMPLE[0]["text"], "importance": 0.9},
+            ],
+        )
+
+        seen = []
+
+        async def fake_render(*args, **kwargs):
+            seen.append(kwargs)
+            return {"status": "rendered", "output_path": str(tmp_path / "corte_shorts.mp4")}
+
+        monkeypatch.setattr(engine_module, "render_video_hyperframes", fake_render)
+
+        summary = asyncio.run(sp.generate_shorts("corte"))
+
+        assert summary["status"] == "rendered"
+        assert len(seen) == 1, "the cut must still render exactly once"
+        assert "music_track" not in seen[0], (
+            "this pipeline selects no track, so the renderer must not be told one"
+        )
+        assert seen[0]["music_auto"] is False, (
+            "sending True here would report a library failure for silence by design"
+        )
+
+    def test_the_pipeline_selects_no_music_of_its_own(self):
+        """The verdict above rests on this: no pick_track, no music_track.
+
+        Read off the parsed module rather than the raw text, so the comments that
+        explain the verdict do not count as uses of it.
+        """
+        import ast
+
+        from pathlib import Path
+
+        tree = ast.parse(Path(sp.__file__).read_text(encoding="utf-8"))
+        referenced = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                referenced.add(node.attr)
+            elif isinstance(node, ast.Name):
+                referenced.add(node.id)
+            elif isinstance(node, ast.keyword) and node.arg:
+                referenced.add(node.arg)
+
+        assert "pick_track" not in referenced, (
+            "auto-BGM has been wired into this pipeline: the music_auto verdict "
+            "has to be revisited with it"
+        )
+        assert "music_track" not in referenced, (
+            "this pipeline now names a track, so it is no longer a caller that "
+            "asks for deliberate silence"
+        )
+
+
 class TestListHighlights:
     def test_missing_srt(self, tmp_path, monkeypatch):
         monkeypatch.setattr(sp, "UPLOAD_DIR", tmp_path)

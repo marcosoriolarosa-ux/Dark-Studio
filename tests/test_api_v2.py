@@ -539,6 +539,27 @@ class TestBuildVideoWiring:
         assert kwargs["music_volume"] == pytest.approx(0.18)
         assert kwargs["duck_voice"] is True
 
+    def test_the_endpoint_always_asks_for_deliberate_silence(self, storage):
+        """build-video never auto-selects, so music_auto is always False here.
+
+        This endpoint takes music_track straight from the form and never calls
+        music.pick_track, so an empty value is the request saying "no bed". If the
+        flag were ever sent as True the render would tell the user the library
+        had no usable track for a video that was always meant to be silent - the
+        false failure this signal exists to remove.
+        """
+        renderer = mock.AsyncMock(return_value={"status": "rendered"})
+        assert self._post(storage, renderer).status_code == 200
+        assert renderer.call_args[1]["music_auto"] is False
+        assert renderer.call_args[1]["music_track"] == ""
+
+        renderer = mock.AsyncMock(return_value={"status": "rendered"})
+        assert self._post(storage, renderer, music_track="dark-depths").status_code == 200
+        assert renderer.call_args[1]["music_auto"] is False, (
+            "a named track is the caller's choice, not an auto-BGM request"
+        )
+        assert renderer.call_args[1]["music_track"] == "dark-depths"
+
     def test_malformed_subtitle_style_json_is_a_400(self, storage):
         renderer = mock.AsyncMock(return_value={"status": "rendered"})
         response = self._post(storage, renderer, subtitle_style="{not json")

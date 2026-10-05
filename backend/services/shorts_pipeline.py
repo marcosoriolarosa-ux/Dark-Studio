@@ -442,6 +442,9 @@ async def generate_shorts(
         aspect_ratio,
         output_stem=f"{project_name}_shorts",
         media_pool=[item.get("url", "") for item in media if item.get("url")],
+        # No music is selected here either: this module never calls
+        # music.pick_track, so a cut with no bed is the design, not a failure.
+        music_auto=False,
     )
 
     summary = {
