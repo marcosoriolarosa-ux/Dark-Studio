@@ -361,11 +361,19 @@ def register_upload(source_path: Path, title: str = "", mood: str = "ambient") -
 def pick_track(mood: str = "", exclude_ids: Optional[List[str]] = None) -> Optional[Track]:
     """Pick a track for auto-BGM.
 
+    Materialises the builtin library first. ``storage/music/*`` is gitignored,
+    so a fresh checkout ships an empty directory and the six procedural tracks
+    only exist once something generates them. Auto-BGM is that something: the
+    catalogue is on disk by the time a track is chosen. Idempotent, and one
+    ``stat`` per spec once the library exists.
+
     Honours ``exclude_ids`` so a re-render does not repeat the track it just
     used, and falls back to the whole library when the mood has nothing left, so
-    a render still gets music. None only when the library is empty or every
-    candidate is excluded.
+    a render still gets music. None only when no track can be produced at all -
+    an unbuildable library, or every candidate excluded - and never a fabricated
+    id; callers should then report ``missing_library_note()``.
     """
+    ensure_builtin_library()
     excluded = {str(item) for item in (exclude_ids or [])}
     candidates = [t for t in list_tracks(mood) if t.id not in excluded]
     if not candidates and mood:
@@ -699,6 +707,28 @@ def ensure_builtin_library() -> List[Track]:
         except Exception:
             continue
     return list_tracks()
+
+
+def missing_library_note() -> str:
+    """Portuguese explanation for the one case auto-BGM cannot cover.
+
+    ``pick_track`` returns None when no track can be produced at all, and the
+    render then reports ``applied=False``. With an empty note the user would get
+    a silent video and no explanation, so the wording for that failure lives
+    here, next to the library that failed to appear. Never raises and never
+    claims a track exists.
+    """
+    if np is None:
+        return (
+            "musica nao aplicada: a biblioteca de trilhas esta vazia e o numpy "
+            "nao esta instalado, portanto a biblioteca integrada nao pode ser "
+            "gerada; o video foi mantido sem trilha sonora."
+        )
+    return (
+        "musica nao aplicada: nenhuma faixa da biblioteca de trilhas ficou "
+        "disponivel e a biblioteca integrada nao pode ser gerada; o video foi "
+        "mantido sem trilha sonora."
+    )
 
 
 # --------------------------------------------------------------------- mixing

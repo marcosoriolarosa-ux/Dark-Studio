@@ -36,6 +36,28 @@ def music_dir(tmp_path, monkeypatch):
     return target
 
 
+@pytest.fixture
+def empty_music_dir(tmp_path, monkeypatch):
+    """An isolated MUSIC_DIR in the state a fresh checkout is in.
+
+    storage/music/* is gitignored, so the directory is there and empty: the six
+    procedural tracks do not exist until something builds them. Short specs keep
+    the self-heal fast.
+    """
+    target = tmp_path / "fresh-music"
+    target.mkdir()
+    monkeypatch.setattr(music, "MUSIC_DIR", target)
+    monkeypatch.setattr(
+        music,
+        "BUILTIN_SPECS",
+        tuple(dataclasses.replace(spec, duration=SHORT_DURATION) for spec in music.BUILTIN_SPECS),
+    )
+    monkeypatch.setattr(
+        music, "_BUILTIN_BY_ID", dict((s.id, s) for s in music.BUILTIN_SPECS)
+    )
+    return target
+
+
 def _wav_bytes(path: Path) -> bytes:
     return Path(path).read_bytes()
 
@@ -70,9 +92,14 @@ def test_builtin_spec_durations_are_within_thirty_to_ninety_seconds():
 
 
 def test_list_tracks_is_empty_for_a_fresh_directory(tmp_path, monkeypatch):
+    # A fresh checkout's library is empty because storage/music/* is gitignored.
+    # list_tracks is a pure read, so it must report that emptiness and must NOT
+    # generate the library as a side effect of a catalogue query.
     monkeypatch.setattr(music, "MUSIC_DIR", tmp_path / "missing-music")
     assert music.list_tracks() == []
-    assert music.pick_track() is None
+    # The directory itself is created, as list_tracks has always done, but not a
+    # single track is generated: reading the catalogue stays free.
+    assert not list((tmp_path / "missing-music").glob("*.wav"))
 
 
 def test_ensure_builtin_library_covers_every_mood(music_dir):
@@ -228,10 +255,18 @@ def test_track_to_dict_shape(music_dir):
 # ----------------------------------------------------------------- auto pick
 
 
-def test_pick_track_returns_none_on_empty_library(tmp_path, monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_DIR", tmp_path / "empty")
+def test_pick_track_returns_none_when_the_library_cannot_be_built(empty_music_dir, monkeypatch):
+    # The self-heal can still fail. Then pick_track must report "no track"
+    # instead of inventing an id, and it must not raise: a missing music bed is
+    # never a reason to lose a finished render.
+    def refuse(*args, **kwargs):
+        raise RuntimeError("synthesis unavailable")
+
+    monkeypatch.setattr(music, "synthesize", refuse)
+
     assert music.pick_track() is None
     assert music.pick_track("ambient") is None
+    assert not any(empty_music_dir.iterdir())
 
 
 def test_pick_track_respects_mood_and_exclusions(music_dir):
@@ -244,6 +279,129 @@ def test_pick_track_respects_mood_and_exclusions(music_dir):
 
     exhausted = music.pick_track(exclude_ids=all_ids)
     assert exhausted is None
+
+
+# ------------------------------------------------- self-healing the library
+#
+# storage/music/* is gitignored, so a fresh checkout has no tracks at all. The
+# one-click path (generator.py pick_track) is the first thing that needs music,
+# so it is also the thing that must build the library. Before this, pick_track
+# read an empty directory, returned None, and every render came out silent.
+
+
+def test_pick_track_builds_the_builtin_library_it_needs(empty_music_dir):
+    assert music.list_tracks() == []
+
+    chosen = music.pick_track("ambient")
+
+    assert chosen is not None
+    assert chosen.mood == "ambient"
+    assert chosen.builtin is True
+    assert Path(chosen.path).exists()
+    assert Path(chosen.path).stat().st_size > 0
+    assert len(music.list_tracks()) >= 6
+
+
+def test_pick_track_self_heals_a_missing_music_directory(tmp_path, monkeypatch):
+    # The harsher fresh-checkout case: not even the directory survived.
+    monkeypatch.setattr(music, "MUSIC_DIR", tmp_path / "not-there")
+    monkeypatch.setattr(
+        music,
+        "BUILTIN_SPECS",
+        tuple(dataclasses.replace(spec, duration=SHORT_DURATION) for spec in music.BUILTIN_SPECS),
+    )
+    monkeypatch.setattr(
+        music, "_BUILTIN_BY_ID", dict((s.id, s) for s in music.BUILTIN_SPECS)
+    )
+
+    chosen = music.pick_track("lofi")
+
+    assert chosen is not None and chosen.mood == "lofi"
+    assert (tmp_path / "not-there").is_dir()
+    assert len(list((tmp_path / "not-there").glob("*.wav"))) >= 6
+
+
+def test_pick_track_does_not_rewrite_a_library_that_is_already_built(music_dir):
+    # The self-heal has to stay cheap: an existing track is reused, not
+    # regenerated, or every one-click job would re-synthesise six tracks.
+    before = dict(
+        (p.name, (p.stat().st_mtime_ns, _wav_bytes(p))) for p in music_dir.glob("*.wav")
+    )
+    assert len(before) >= 6
+
+    assert music.pick_track("ambient") is not None
+
+    after = dict(
+        (p.name, (p.stat().st_mtime_ns, _wav_bytes(p))) for p in music_dir.glob("*.wav")
+    )
+    assert after == before
+
+
+def test_pick_track_never_fabricates_a_track_id(empty_music_dir):
+    chosen = music.pick_track("tension")
+
+    assert chosen is not None
+    assert chosen.id in dict((t.id, t) for t in music.list_tracks())
+    assert Path(chosen.path).is_file()
+    # And an id that is not on disk must never resolve to anything.
+    assert music.get_track("no-such-track-on-disk") is None
+
+
+def test_an_explicit_track_id_resolves_to_itself_not_a_mood_pick(empty_music_dir):
+    # generator.py only calls pick_track when the caller sent no music_track, so
+    # a caller-supplied id is resolved through get_track. It must come back as
+    # itself - its own mood, never swapped for a random pick.
+    assert music.pick_track("ambient") is not None
+
+    for spec in music.BUILTIN_SPECS:
+        found = music.get_track(spec.id)
+        assert found is not None
+        assert found.id == spec.id
+        assert found.mood == spec.mood
+
+
+# ------------------------------------------------------ honest failure report
+
+
+def test_missing_library_note_says_why_in_portuguese():
+    note = music.missing_library_note()
+
+    assert note
+    assert note.strip() == note
+    assert "musica nao aplicada" in note
+    assert "trilha sonora" in note
+    # It explains a failure; it must never read as a success.
+    assert "misturada" not in note
+    assert "applied" not in note
+
+
+def test_missing_library_note_names_numpy_only_when_numpy_is_missing(monkeypatch):
+    real_np = music.np
+    if real_np is None:  # pragma: no cover - only on a clone without numpy
+        pytest.skip("numpy is not installed")
+
+    monkeypatch.setattr(music, "np", None)
+    without_numpy = music.missing_library_note()
+    monkeypatch.setattr(music, "np", real_np)
+    with_numpy = music.missing_library_note()
+
+    assert "numpy" in without_numpy
+    assert "numpy" not in with_numpy
+
+
+def test_an_unbuildable_library_reports_a_reason_rather_than_silence(empty_music_dir, monkeypatch):
+    # End of the failure the production run hit: no track can be produced, the
+    # render reports applied=False, and the user must be told why.
+    def refuse(*args, **kwargs):
+        raise RuntimeError("synthesis unavailable")
+
+    monkeypatch.setattr(music, "synthesize", refuse)
+
+    assert music.pick_track("ambient") is None
+
+    note = music.missing_library_note()
+    assert note
+    assert "sem trilha sonora" in note
 
 
 # -------------------------------------------------------------------- mixing

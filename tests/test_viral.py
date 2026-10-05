@@ -134,6 +134,14 @@ class TestPlatformMetadata:
 
 
 class TestViralPipelineIntegration:
+    # WHY slow + live: render_viral_video drives a real HyperFrames render
+    # (npx + chrome-headless-shell + ffmpeg, measured at 354s) AND calls
+    # search_media_for_scenes / search_media_for_keywords, which hit Pexels
+    # and Pixabay over the real network. It only skips when media_test.srt is
+    # absent, and that file IS in the repo, so without these markers the plain
+    # pytest default dragged in a six-minute render. Run with -m slow.
+    @pytest.mark.slow
+    @pytest.mark.live
     @pytest.mark.asyncio
     async def test_render_viral_video_full_pipeline(self):
         """Integration test - requires audio and SRT files."""
