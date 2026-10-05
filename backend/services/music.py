@@ -106,6 +106,12 @@ BUILTIN_SPECS: Tuple[BuiltinSpec, ...] = (
 
 _BUILTIN_BY_ID = {spec.id: spec for spec in BUILTIN_SPECS}
 
+# RNG used by pick_track. A dedicated instance rather than the global ``random``
+# module so a caller (or a test) can inject a seeded one and keep the suite
+# reproducible. In production this is left unseeded, so auto-BGM really does
+# vary between renders instead of quietly repeating.
+_music_rng = random.Random()
+
 
 # ----------------------------------------------------------------- path safety
 
@@ -372,6 +378,14 @@ def pick_track(mood: str = "", exclude_ids: Optional[List[str]] = None) -> Optio
     a render still gets music. None only when no track can be produced at all -
     an unbuildable library, or every candidate excluded - and never a fabricated
     id; callers should then report ``missing_library_note()``.
+
+    Among the admissible candidates the choice is random, not first-match and
+    not mood-deterministic: with several tracks in one mood a re-render of the
+    same topic no longer lands on the same track by luck of ordering. The RNG is
+    ``music._music_rng`` - inject a seeded ``random.Random`` to make a run
+    reproducible. When a mood has exactly one candidate the choice is a no-op;
+    that is the case for the six built-ins, so the benefit only shows up once
+    someone uploads tracks.
     """
     ensure_builtin_library()
     excluded = {str(item) for item in (exclude_ids or [])}
@@ -380,7 +394,7 @@ def pick_track(mood: str = "", exclude_ids: Optional[List[str]] = None) -> Optio
         candidates = [t for t in list_tracks() if t.id not in excluded]
     if not candidates:
         return None
-    return random.choice(candidates)
+    return _music_rng.choice(candidates)
 
 
 # ------------------------------------------------------------------ generation

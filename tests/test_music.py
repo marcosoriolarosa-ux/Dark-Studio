@@ -6,6 +6,7 @@ tracks so the suite stays fast. A separate test asserts the real spec lengths
 are the 30-90s the library contract requires, without rendering them.
 """
 import dataclasses
+import random
 import subprocess
 import wave
 from pathlib import Path
@@ -253,6 +254,92 @@ def test_track_to_dict_shape(music_dir):
 
 
 # ----------------------------------------------------------------- auto pick
+
+
+@pytest.fixture
+def ambient_pool(music_dir, tmp_path):
+    """Four extra uploads sharing the ``ambient`` mood with the builtin.
+
+    The six built-ins are one-per-mood, so the default library makes every mood
+    deterministic and randomisation is a no-op there. This pool is what makes the
+    change observable: five ambient candidates, so a pick can genuinely vary.
+    """
+    for index in range(4):
+        music.register_upload(
+            _write_sample_wav(tmp_path / f"ambient-upload-{index}.wav"),
+            title=f"Ambient Upload {index}",
+            mood="ambient",
+        )
+    return music_dir
+
+
+def test_pick_track_is_not_deterministic_over_a_multi_candidate_pool(ambient_pool, monkeypatch):
+    """The selection is genuinely random, not first-match, not mood-deterministic.
+
+    Proven with an injected seeded RNG rather than by chance: the same seed yields
+    the same sequence across two runs, and a different seed yields a different one.
+    Over 50 calls against a five-candidate pool more than one track comes back -
+    this is the test that fails against the old deterministic code, where the
+    builtin always sorts first and every call returned ``ambient-drift``.
+    """
+    def seeded_run(seed, count=50):
+        monkeypatch.setattr(music, "_music_rng", random.Random(seed))
+        return [music.pick_track("ambient").id for _ in range(count)]
+
+    first = seeded_run(42)
+    second = seeded_run(42)
+    assert first == second, "same seed must reproduce the same sequence"
+    assert seeded_run(7) != first, "different seed must differ"
+
+    assert len(set(first)) > 1, (
+        "pick_track returned a single track over 50 calls; "
+        "the choice is not random for this pool"
+    )
+
+
+def test_pick_track_rng_is_injectable_and_unseeded_by_default(ambient_pool):
+    """The module exposes a ``random.Random`` instance; tests own the seed."""
+    import random as _random
+    assert isinstance(music._music_rng, _random.Random)
+
+
+def test_pick_track_excludes_together_with_random_selection(ambient_pool, monkeypatch):
+    """``exclude_ids`` still rejects tracks, and the pick is random among the rest."""
+    pool = [t.id for t in music.list_tracks("ambient")]
+    victim = pool[0]
+
+    monkeypatch.setattr(music, "_music_rng", random.Random(123))
+    for _ in range(40):
+        assert music.pick_track("ambient", exclude_ids=[victim]).id != victim
+
+    # Excluding the whole ambient pool leaves nothing in that mood, so pick_track
+    # falls back to the whole library - the documented behaviour, not a bug.
+    # Excluding the *entire* catalogue is what yields None.
+    monkeypatch.setattr(music, "_music_rng", random.Random(123))
+    fallback = music.pick_track("ambient", exclude_ids=pool)
+    assert fallback is not None and fallback.mood != "ambient"
+
+    monkeypatch.setattr(music, "_music_rng", random.Random(123))
+    assert music.pick_track("ambient", exclude_ids=[t.id for t in music.list_tracks()]) is None
+
+
+def test_pick_track_single_candidate_mood_is_a_noop(music_dir):
+    """With one candidate per mood the six built-ins stay mood-deterministic.
+
+    Randomisation cannot help when there is nothing to choose between, and the
+    existing tests that assume a mood maps to one track must keep passing. Uses the
+    plain ``music_dir`` fixture (no uploads), so every mood really does have exactly
+    one candidate - the ambient pool would make this test meaningless.
+    """
+    for mood in music.MOODS:
+        picks = {music.pick_track(mood).id for _ in range(20)}
+        assert len(picks) == 1, f"mood {mood!r} produced {picks}"
+
+
+def test_pick_track_pool_makes_a_mood_non_deterministic(ambient_pool):
+    """The flip side: once a mood has several candidates it is no longer fixed."""
+    picks = {music.pick_track("ambient").id for _ in range(30)}
+    assert len(picks) > 1
 
 
 def test_pick_track_returns_none_when_the_library_cannot_be_built(empty_music_dir, monkeypatch):
